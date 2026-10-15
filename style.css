@@ -177,3 +177,21 @@
 .fat-more {
     align-self: center;
 }
+
+.fat-preview {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    text-align: left;
+}
+
+.fat-preview h3 {
+    margin: 0;
+}
+
+.fat-preview-turn {
+    padding: 6px 8px;
+    border-left: 3px solid var(--SmartThemeQuoteColor, #e18a24);
+    background-color: var(--black30a, rgba(0, 0, 0, 0.3));
+    border-radius: 4px;
+}

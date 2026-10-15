@@ -15,6 +15,9 @@ export const MODEL_LABELS = Object.freeze({
     'drama-3': 'Drama 3 (paid)',
 });
 
+/** Models that take several voices in one request (`<|speaker:N|>` markers plus a `reference_id` list). */
+export const MULTI_SPEAKER_MODELS = Object.freeze(['s2.1-pro-free', 's2.1-pro', 's2-pro', 'drama-3']);
+
 export const DEFAULT_SETTINGS = Object.freeze({
     voiceMap: {},
     model: 's2.1-pro-free',
@@ -24,9 +27,18 @@ export const DEFAULT_SETTINGS = Object.freeze({
     top_p: 0.7,
     normalize_loudness: true,
     cache_audio: true,
+    multi_speaker: true,
     /** @type {SavedVoice[]} */
     savedVoices: [],
+    /** @type {Speaker[]} */
+    speakers: [],
 });
+
+/**
+ * @typedef {object} Speaker
+ * @property {string} name Name as it appears before the colon
+ * @property {string} voice Label of a saved voice
+ */
 
 /**
  * @typedef {object} SavedVoice
@@ -117,6 +129,11 @@ export function mergeSettings(stored) {
             out.savedVoices = Array.isArray(value)
                 ? value.filter(v => v && isVoiceId(v.id) && typeof v.label === 'string')
                     .map(v => ({ ...v, languages: Array.isArray(v.languages) ? v.languages : [], sample: stableSample(v.sample) }))
+                : [];
+        } else if (key === 'speakers') {
+            out.speakers = Array.isArray(value)
+                ? value.filter(v => v && typeof v.name === 'string' && typeof v.voice === 'string')
+                    .map(v => ({ name: v.name, voice: v.voice }))
                 : [];
         } else if (key === 'voiceMap') {
             out.voiceMap = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
@@ -238,4 +255,102 @@ export function formatCredit(credit) {
     if (credit === null || credit === undefined || credit === '') return 'unknown';
     const n = Number(credit);
     return Number.isFinite(n) ? `$${n.toFixed(2)}` : 'unknown';
+}
+
+// Several voices per message.
+//
+// SillyTavern collapses line breaks before it calls generateTts, so speaker
+// lines are found earlier, in processText, and replaced with a marker that
+// survives the collapse. generateTts then turns the markers into Fish's
+// `<|speaker:N|>` format with one voice per speaker.
+
+const MARK_OPEN = '\u27EA';
+const MARK_CLOSE = '\u27EB';
+const MARK_RE = new RegExp(`${MARK_OPEN}([^${MARK_CLOSE}]{1,40})${MARK_CLOSE}`, 'g');
+// "Alice: text", "**Alice**: text", "Old Tom: text". Up to 4 words, 40 characters.
+const SPEAKER_LINE_RE = /^([ \t]*)(?:\*\*|__)?([\p{L}\p{N}][\p{L}\p{N}.'\u2019-]*(?: [\p{L}\p{N}][\p{L}\p{N}.'\u2019-]*){0,3})(?:\*\*|__)?[ \t]*:(?!\/\/)[ \t]*(?=\S)/u;
+/** Marker name meaning "back to the message's own voice". Can't clash: names start with a letter or digit. */
+const DEFAULT_SPEAKER = '*';
+
+/** @param {string} name */
+export function speakerMark(name) {
+    return `${MARK_OPEN}${name}${MARK_CLOSE}`;
+}
+
+/**
+ * Replaces `Name:` at the start of a line with a speaker marker, but only for
+ * names that resolve to a voice. "Note:" or "Time:" lines stay untouched.
+ * Each line stands alone: once a speaker line has appeared, an unlabelled
+ * line goes back to the message's own voice, as narration does in a script.
+ * @param {string} text
+ * @param {(name: string) => boolean} isKnown
+ */
+export function markSpeakerLines(text, isKnown) {
+    let marked = false;
+    return String(text).split('\n').map((line) => {
+        const match = SPEAKER_LINE_RE.exec(line);
+        if (match && match[2].length <= 40 && isKnown(match[2])) {
+            marked = true;
+            return `${match[1]}${speakerMark(match[2])} ${line.slice(match[0].length)}`;
+        }
+        if (marked && line.trim()) return `${speakerMark(DEFAULT_SPEAKER)} ${line}`;
+        return line;
+    }).join('\n');
+}
+
+/** @param {string} text */
+export function stripSpeakerMarks(text) {
+    return String(text).replace(MARK_RE, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/** @param {string} text */
+export function hasSpeakerMarks(text) {
+    return new RegExp(MARK_RE.source).test(String(text));
+}
+
+/**
+ * Splits marked text into speaker turns. Text before the first marker has no speaker.
+ * @param {string} text
+ * @returns {{speaker: string|null, text: string}[]}
+ */
+export function splitSpeakerSegments(text) {
+    const out = [];
+    let speaker = null;
+    let last = 0;
+    for (const match of String(text).matchAll(MARK_RE)) {
+        out.push({ speaker, text: text.slice(last, match.index) });
+        speaker = match[1] === DEFAULT_SPEAKER ? null : match[1];
+        last = match.index + match[0].length;
+    }
+    out.push({ speaker, text: text.slice(last) });
+    return out
+        .map(s => ({ speaker: s.speaker, text: s.text.replace(/\s+/g, ' ').trim() }))
+        .filter(s => s.text);
+}
+
+/**
+ * Builds a Fish request from speaker turns. Turns without a known voice use
+ * the message's own voice. Neighbouring turns with the same voice merge.
+ * @param {{speaker: string|null, text: string}[]} segments
+ * @param {(name: string) => string|null} resolveVoice Speaker name to voice id
+ * @param {string} defaultVoiceId The voice SillyTavern picked for this message
+ * @returns {{voices: string[], text: string, turns: {voiceId: string, speaker: string|null, text: string}[]}}
+ */
+export function buildSpeakerRequest(segments, resolveVoice, defaultVoiceId) {
+    /** @type {{voiceId: string, speaker: string|null, text: string}[]} */
+    const turns = [];
+    for (const segment of segments) {
+        const voiceId = (segment.speaker && resolveVoice(segment.speaker)) || defaultVoiceId;
+        const prev = turns.at(-1);
+        if (prev && prev.voiceId === voiceId) {
+            prev.text = `${prev.text} ${segment.text}`;
+        } else {
+            turns.push({ voiceId, speaker: segment.speaker, text: segment.text });
+        }
+    }
+    const voices = [...new Set(turns.map(t => t.voiceId))];
+    const text = voices.length <= 1
+        ? turns.map(t => t.text).join(' ')
+        : turns.map(t => `<|speaker:${voices.indexOf(t.voiceId)}|>${t.text}`).join('');
+    return { voices, text, turns };
 }

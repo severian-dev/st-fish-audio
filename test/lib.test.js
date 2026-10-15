@@ -2,16 +2,21 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+    buildSpeakerRequest,
     buildTtsBody,
     buildVoiceObjects,
     compareVersions,
     DEFAULT_SETTINGS,
     formatBytes,
     formatCredit,
+    hasSpeakerMarks,
+    markSpeakerLines,
     mergeSettings,
     parseVoiceInput,
     sanitizeLabel,
+    splitSpeakerSegments,
     stableSample,
+    stripSpeakerMarks,
     toSavedVoice,
     uniqueLabel,
 } from '../lib.js';
@@ -138,5 +143,54 @@ describe('stableSample', () => {
         assert.equal(toSavedVoice({ id: ID, title: 'S', sample: signed }, []).sample, null);
         const voices = buildVoiceObjects([], [{ id: ID2, title: 'Me', sample: signed }]);
         assert.equal(voices[0].preview_url, false);
+    });
+});
+
+describe('several voices per message', () => {
+    const known = (n) => ['Alice', 'Old Tom', 'Zoë'].includes(n);
+
+    it('marks known speaker lines only', () => {
+        const text = 'The door opens.\nAlice: "Hi."\nNote: not a speaker\n**Old Tom**: Grr.\n  Zoë:Bonjour\nTime: 3pm';
+        const segs = splitSpeakerSegments(markSpeakerLines(text, known).replace(/\s+/g, ' '));
+        assert.deepEqual(segs, [
+            { speaker: null, text: 'The door opens.' },
+            { speaker: 'Alice', text: '"Hi."' },
+            { speaker: null, text: 'Note: not a speaker' },
+            { speaker: 'Old Tom', text: 'Grr.' },
+            { speaker: 'Zoë', text: 'Bonjour' },
+            { speaker: null, text: 'Time: 3pm' },
+        ]);
+    });
+
+    it('leaves text without speaker lines alone', () => {
+        const text = 'Just prose.\nMore prose: with a colon.';
+        assert.equal(markSpeakerLines(text, known), text);
+        assert.equal(hasSpeakerMarks(text), false);
+    });
+
+    it('ignores colons later in a line, URLs and over-long names', () => {
+        assert.equal(hasSpeakerMarks(markSpeakerLines('She said Alice: no.', known)), false);
+        assert.equal(hasSpeakerMarks(markSpeakerLines('https://example.com', () => true)), false);
+        assert.equal(hasSpeakerMarks(markSpeakerLines('Alice the very long-winded queen of: x', () => true)), false);
+    });
+
+    it('builds one multi-speaker request with voices in order of appearance', () => {
+        const segs = splitSpeakerSegments(markSpeakerLines('Narration.\nAlice: Hi.\nOld Tom: Grr.\nAlice: Bye.', known).replace(/\s+/g, ' '));
+        const voices = { Alice: 'A', 'Old Tom': 'T' };
+        const req = buildSpeakerRequest(segs, n => voices[n] ?? null, 'D');
+        assert.deepEqual(req.voices, ['D', 'A', 'T']);
+        assert.equal(req.text, '<|speaker:0|>Narration.<|speaker:1|>Hi.<|speaker:2|>Grr.<|speaker:1|>Bye.');
+    });
+
+    it('merges neighbours with the same voice and drops markers when only one voice is left', () => {
+        const segs = [{ speaker: null, text: 'One.' }, { speaker: 'Alice', text: 'Two.' }, { speaker: 'Ghost', text: 'Three.' }];
+        const req = buildSpeakerRequest(segs, n => (n === 'Alice' ? 'D' : null), 'D');
+        assert.deepEqual(req.voices, ['D']);
+        assert.equal(req.text, 'One. Two. Three.');
+    });
+
+    it('marks survive whitespace collapse and strip cleanly', () => {
+        const marked = markSpeakerLines('Alice: Hi.\nThen silence.', known);
+        assert.equal(stripSpeakerMarks(marked.replace(/\s+/g, ' ')), 'Hi. Then silence.');
     });
 });

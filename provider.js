@@ -6,21 +6,30 @@
 import { getPreviewString, initVoiceMap, saveTtsProviderSettings } from '../../tts/index.js';
 import { openVoiceBrowser } from './browser.js';
 import {
+    buildSpeakerRequest,
     buildTtsBody,
     buildVoiceObjects,
     compareVersions,
     formatBytes,
     formatCredit,
+    hasSpeakerMarks,
     isVoiceId,
+    markSpeakerLines,
     mergeSettings,
     MIN_PLUGIN_VERSION,
     MODEL_LABELS,
+    MULTI_SPEAKER_MODELS,
     parseVoiceInput,
     PLUGIN_BASE,
     SECRET_KEY,
     SILENCE_URL,
+    splitSpeakerSegments,
     toSavedVoice,
 } from './lib.js';
+
+// SillyTavern's voice map markers.
+const DEFAULT_VOICE_MARKER = '[Default Voice]';
+const DISABLED_VOICE_MARKER = 'disabled';
 
 const OWN_VOICES_TTL_MS = 5 * 60_000;
 const PLUGIN_URL = 'https://github.com/severian-dev/st-fish-audio-plugin';
@@ -108,6 +117,19 @@ const SETTINGS_HTML = `
         <div id="fat_add" class="menu_button">Add</div>
     </div>
     <div id="fat_saved" class="fat-saved"></div>
+    <h4 class="fat-heading">Several voices in one message</h4>
+    <label class="checkbox_label" for="fat_multi_speaker">
+        <input id="fat_multi_speaker" type="checkbox">
+        <span>Voice <code>Name:</code> lines with that character's voice</span>
+    </label>
+    <small>A line starting with a known name, like <code>Alice: "Hi"</code>, uses Alice's voice. Other lines use the
+    message's voice. Names come from the voice map and the list below. Turn off "Only narrate quotes" and "Different
+    voices for quotes" for this to work.</small>
+    <div id="fat_speakers" class="fat-saved"></div>
+    <div class="flex-container flexGap5">
+        <div id="fat_speaker_add" class="menu_button menu_button_icon"><i class="fa-solid fa-plus"></i><span>Add name</span></div>
+        <div id="fat_speaker_preview" class="menu_button menu_button_icon"><i class="fa-solid fa-eye"></i><span>Preview last message</span></div>
+    </div>
 </div>`;
 
 export class FishAudioTtsProvider {
@@ -140,6 +162,7 @@ export class FishAudioTtsProvider {
         this.refreshCredit();
         this.refreshCache();
         this.renderSavedVoices();
+        this.renderSpeakers();
     }
 
     async checkReady() {
@@ -182,11 +205,41 @@ export class FishAudioTtsProvider {
     }
 
     /**
+     * Runs before SillyTavern collapses line breaks, so speaker lines are
+     * marked here while they are still lines.
+     * @param {string} text
+     */
+    async processText(text) {
+        if (!this.settings.multi_speaker) return text;
+        if (!this.voices.length) await this.fetchTtsVoiceObjects();
+        return markSpeakerLines(text, (name) => Boolean(this.speakerVoiceId(name)));
+    }
+
+    /**
      * @param {string} text
      * @param {string} voiceId
-     * @returns {Promise<string>} URL that streams the audio
+     * @returns {Promise<string|AsyncGenerator<string>>} URL that streams the audio, or one URL per turn
      */
     async generateTts(text, voiceId) {
+        if (!hasSpeakerMarks(text)) return this.requestTts(text, voiceId);
+
+        const request = buildSpeakerRequest(splitSpeakerSegments(text), (name) => this.speakerVoiceId(name), voiceId);
+        if (!request.turns.length) return SILENCE_URL;
+        if (request.voices.length === 1) return this.requestTts(request.text, request.voices[0]);
+        if (MULTI_SPEAKER_MODELS.includes(this.settings.model)) return this.requestTts(request.text, request.voices);
+
+        // Models without multi-speaker support get one clip per turn.
+        const self = this;
+        return (async function* () {
+            for (const turn of request.turns) yield await self.requestTts(turn.text, turn.voiceId);
+        })();
+    }
+
+    /**
+     * @param {string} text
+     * @param {string|string[]} voiceId One voice, or one per `<|speaker:N|>`
+     */
+    async requestTts(text, voiceId) {
         if (!String(text ?? '').trim()) return SILENCE_URL;
         try {
             const data = await pluginApi('/tts', {
@@ -198,6 +251,28 @@ export class FishAudioTtsProvider {
             // SillyTavern's TTS shows thrown strings as a toast.
             throw `Fish Audio: ${error.status === 404 ? this.missingPluginMessage() : error.message}`;
         }
+    }
+
+    /**
+     * Voice id for a speaker name: the Speakers list first, then SillyTavern's
+     * voice map (group members, the character itself). Case-insensitive.
+     * @param {string} name
+     * @returns {string|null}
+     */
+    speakerVoiceId(name) {
+        const wanted = String(name).trim().toLowerCase();
+        const byLabel = (label) => this.voices.find(v => v.name === label)?.voice_id ?? null;
+
+        const listed = this.settings.speakers.find(s => s.name.trim().toLowerCase() === wanted);
+        if (listed) return byLabel(listed.voice);
+
+        const map = this.settings.voiceMap ?? {};
+        const key = Object.keys(map).find(k => k.toLowerCase() === wanted);
+        if (!key) return null;
+        let label = map[key];
+        if (label === DEFAULT_VOICE_MARKER) label = map[DEFAULT_VOICE_MARKER];
+        if (!label || label === DISABLED_VOICE_MARKER || label === DEFAULT_VOICE_MARKER) return null;
+        return byLabel(label);
     }
 
     /**
@@ -340,6 +415,83 @@ export class FishAudioTtsProvider {
         }
     }
 
+    renderSpeakers() {
+        const box = document.getElementById('fat_speakers');
+        if (!box) return;
+        box.replaceChildren();
+        const labels = this.settings.savedVoices.map(v => v.label);
+        this.settings.speakers.forEach((speaker, index) => {
+            const row = document.createElement('div');
+            row.className = 'fat-saved-row';
+            const name = Object.assign(document.createElement('input'), {
+                type: 'text', className: 'text_pole flex1', value: speaker.name, placeholder: 'Name before the colon',
+            });
+            name.addEventListener('input', () => {
+                speaker.name = name.value.trim();
+                saveTtsProviderSettings();
+            });
+            const voice = document.createElement('select');
+            voice.className = 'text_pole flex1';
+            const options = labels.includes(speaker.voice) || !speaker.voice ? labels : [speaker.voice, ...labels];
+            voice.append(new Option('Pick a saved voice', ''), ...options.map(l => new Option(l, l)));
+            voice.value = speaker.voice;
+            voice.addEventListener('change', () => {
+                speaker.voice = voice.value;
+                saveTtsProviderSettings();
+            });
+            const remove = this.iconButton('fa-trash-can', 'Remove this name');
+            remove.addEventListener('click', () => {
+                this.settings.speakers.splice(index, 1);
+                saveTtsProviderSettings();
+                this.renderSpeakers();
+            });
+            row.append(name, voice, remove);
+            box.append(row);
+        });
+    }
+
+    addSpeaker() {
+        this.settings.speakers.push({ name: '', voice: '' });
+        saveTtsProviderSettings();
+        this.renderSpeakers();
+        $('#fat_speakers input').last().trigger('focus');
+    }
+
+    /** Shows how the last chat message would be split between voices. Generates nothing. */
+    async previewLastMessage() {
+        const { chat, callGenericPopup, POPUP_TYPE } = SillyTavern.getContext();
+        const message = [...(chat ?? [])].reverse().find(m => !m.is_system && m.mes);
+        if (!message) {
+            toastr.info('No message to preview yet.', 'Fish Audio TTS');
+            return;
+        }
+        if (!this.voices.length) await this.fetchTtsVoiceObjects();
+        const marked = markSpeakerLines(String(message.mes).replaceAll('*', ''), (name) => Boolean(this.speakerVoiceId(name)));
+        const fallback = this.settings.voiceMap?.[message.name] ?? DEFAULT_VOICE_MARKER;
+        const request = buildSpeakerRequest(splitSpeakerSegments(marked), (name) => this.speakerVoiceId(name), '__message__');
+        const voiceName = (id) => (id === '__message__' ? `${message.name}'s voice (${fallback})` : this.voices.find(v => v.voice_id === id)?.name ?? id);
+
+        const root = document.createElement('div');
+        root.className = 'fat-preview';
+        root.append(Object.assign(document.createElement('h3'), { textContent: `Voices for ${message.name}'s last message` }));
+        for (const turn of request.turns) {
+            const row = document.createElement('div');
+            row.className = 'fat-preview-turn';
+            row.append(
+                Object.assign(document.createElement('b'), { textContent: voiceName(turn.voiceId) }),
+                Object.assign(document.createElement('div'), { textContent: turn.text }),
+            );
+            root.append(row);
+        }
+        const note = !this.settings.multi_speaker
+            ? 'Several voices is off, so the whole message uses one voice.'
+            : request.voices.length > 1 && !MULTI_SPEAKER_MODELS.includes(this.settings.model)
+                ? 'This model can\'t mix voices in one request, so each turn is sent on its own.'
+                : request.voices.length > 1 ? `${request.voices.length} voices, sent as one request.` : 'One voice for the whole message.';
+        root.append(Object.assign(document.createElement('small'), { textContent: note }));
+        await callGenericPopup(root, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
+    }
+
     /** @param {string} icon @param {string} title */
     iconButton(icon, title) {
         const button = document.createElement('div');
@@ -365,6 +517,7 @@ export class FishAudioTtsProvider {
     async voicesChanged() {
         saveTtsProviderSettings();
         this.renderSavedVoices();
+        this.renderSpeakers();
         this.voices = buildVoiceObjects(this.settings.savedVoices, this.ownVoices);
         await initVoiceMap();
     }
@@ -457,6 +610,12 @@ export class FishAudioTtsProvider {
             saveTtsProviderSettings();
         });
         $('#fat_cache_clear').on('click', () => this.clearCache());
+        $('#fat_multi_speaker').prop('checked', s.multi_speaker).on('change', function () {
+            s.multi_speaker = Boolean($(this).prop('checked'));
+            saveTtsProviderSettings();
+        });
+        $('#fat_speaker_add').on('click', () => this.addSpeaker());
+        $('#fat_speaker_preview').on('click', () => this.previewLastMessage());
 
         $('#fat_key_save').on('click', () => this.saveKey());
         $('#fat_key_remove').on('click', () => this.removeKey());
