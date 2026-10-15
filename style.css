@@ -195,3 +195,24 @@
     background-color: var(--black30a, rgba(0, 0, 0, 0.3));
     border-radius: 4px;
 }
+
+.fat-warnings {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.fat-warning {
+    padding: 6px 8px;
+    border-radius: 6px;
+    border: 1px solid var(--warning, #e8a33d);
+    font-size: 0.9em;
+}
+
+.fat-warning::before {
+    content: '\f071';
+    font-family: 'Font Awesome 6 Free';
+    font-weight: 900;
+    margin-right: 6px;
+    color: var(--warning, #e8a33d);
+}

@@ -2,7 +2,7 @@
 
 [Fish Audio](https://fish.audio) voices in SillyTavern's built-in TTS. Narration modes, the voice map, `/speak` and
 the narrate buttons work as usual. Adds a voice browser with free sample playback, several voices in one message,
-emotion cues, and an audio cache so repeated lines cost nothing.
+emotion cues, dialogue-only reading, infobox skipping, and an audio cache so repeated lines cost nothing.
 
 Two parts: this extension and a small [server plugin](https://github.com/severian-dev/st-fish-audio-plugin). Fish's
 speech API does not accept calls from a browser, so the plugin makes them from the SillyTavern server. Your API key
@@ -31,6 +31,23 @@ Tested on SillyTavern 1.19.0.
 - Your own Fish voices show up automatically.
 - Saved voices appear in the voice map. Pick one per character.
 
+## What gets read
+
+Everything below happens before any text reaches Fish, so skipped text costs nothing.
+
+- **Reasoning is never read.** `<think>`, `<thinking>` and `<reasoning>` blocks are dropped, in case a model writes them
+  inline and SillyTavern doesn't parse them out.
+- **Skip infoboxes and markup.** On by default. Drops code blocks, markdown tables, HTML blocks (`<div>`, `<details>`,
+  `<table>` and the like) and HTML comments, plus any tags you list (default: `infobox, status, stats`). Drama 3's
+  voice tags are kept.
+- **Read narration.** On by default. Off reads only dialogue: quoted text and `Name:` lines. On a typical roleplay
+  reply that cuts the text sent, and the cost, to a fraction.
+- **Mute a speaker.** Pick "Muted" in the Speakers list, or set the character to "disabled" in the voice map.
+- **Preview last message** shows what will be read, in which voice, how many bytes, and the rough cost.
+
+Use these instead of SillyTavern's "Skip `<tagged>` blocks" and "Only narrate quotes". Those run first and break
+Drama 3's tags and speaker voices. The settings panel warns when they're on.
+
 ## Several voices in one message
 
 Lines that start with a known name use that character's voice:
@@ -42,7 +59,8 @@ Old Tom: "Just me."
 She stepped back.
 ```
 
-Alice and Old Tom get their own voices, the narration keeps the message's voice. Names come from the voice map
+Alice and Old Tom get their own voices, the narration keeps the message's voice. Pick "Muted" for a name to skip
+their lines. Names come from the voice map
 (characters in the chat) and from the **Speakers** list, which is where NPCs go. Each line stands alone: a line without
 a known name goes back to the message's voice. "Note:" or "Time:" lines are left alone unless you add those names.
 
@@ -78,9 +96,27 @@ the settings.
 | S2.1 Pro | $15 per 1M bytes of text | |
 | S2 Pro | $15 per 1M bytes of text | |
 | S1 | $15 per 1M bytes of text | Deprecated. Fish retires it Dec 31, 2026 and bills it as S2.1 Pro after. |
-| Drama 3 | Paid | |
+| Drama 3 | About $10 per 1M bytes of text | Most expressive. Not on Fish's pricing page, measured in October 2026. |
 
-Paid models use API credit, which is separate from fish.audio app credit. The settings panel shows your balance.
+Paid models use API credit, which is separate from fish.audio app credit. fish.audio's Plus and Pro plans are for the
+web app and don't fund the API. Top up API credit at [fish.audio/app/developers](https://fish.audio/app/developers).
+The settings panel shows your balance.
+
+Rough cost of one reply, read in full: 2,000 tokens of English is about 8 KB of text, so about $0.08 on Drama 3 and
+$0.12 on S2.1 Pro. Dialogue only is usually a third of that or less. Fish bills by UTF-8 bytes, so Chinese, Japanese
+and Korean text costs about 3x per character.
+
+## Drama 3
+
+Drama 3 follows directions much more closely than S2.1 Pro. In testing with the same voice, `[whispering]` and
+`<whisper>…</whisper>` produced a real whisper on Drama 3 and no change on S2.1 Pro.
+
+- Directions written like notes to an actor: `[slow, dangerously quiet]`, `[voice breaking]`.
+- Tags that change only the words inside: `<whisper>`, `<emphasis>`, `<soft>`, `<fast>`, `<slow>`, `<stress>`,
+  `<forceful>`. On other models they become the nearest cue or plain words.
+- **Smooth playback.** Drama 3 generates at about real time or slower, so one long streamed clip can stutter. With this
+  on (default), the text goes out as sentence chunks that all generate at once: the first short sentence starts
+  playing in about 2 seconds, and the rest have a head start by the time they play.
 
 ## Settings
 
@@ -92,10 +128,14 @@ Paid models use API credit, which is separate from fish.audio app credit. The se
 | Temperature | 0.7 | Higher is more varied. |
 | Top P | 0.7 | |
 | Even out loudness | on | S2 models only. |
+| Smooth playback for Drama 3 | on | |
+| Read narration | on | Off reads only dialogue. |
+| Skip infoboxes and markup | on | |
+| Also skip these tags | `infobox, status, stats` | |
 | Reuse audio | on | Needs plugin 0.2.0 or newer. |
 | Several voices per message | on | |
 | Use cues | on | |
-| Ask the chat model to write cues | off | |
+| Ask the chat model to write cues | off | Drama 3 gets its own instruction with directions and word tags. |
 
 ## How it works
 

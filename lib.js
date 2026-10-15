@@ -14,11 +14,17 @@ export const MODEL_LABELS = Object.freeze({
     's2.1-pro': 'S2.1 Pro (paid, $15 per 1M bytes)',
     's2-pro': 'S2 Pro (paid, $15 per 1M bytes)',
     's1': 'S1 (paid, deprecated, retires Dec 31, 2026)',
-    'drama-3': 'Drama 3 (paid)',
+    'drama-3': 'Drama 3 (paid, about $10 per 1M bytes, most expressive)',
 });
 
 /** Models that take several voices in one request (`<|speaker:N|>` markers plus a `reference_id` list). */
 export const MULTI_SPEAKER_MODELS = Object.freeze(['s2.1-pro-free', 's2.1-pro', 's2-pro', 'drama-3']);
+/** Models measured generating slower than real time. Streamed, their audio stalls mid-sentence. */
+export const SLOW_MODELS = Object.freeze(['drama-3']);
+/** USD per 1M UTF-8 bytes. Drama 3 isn't on Fish's pricing page, $10 was measured on 2026-10-16. */
+export const MODEL_PRICES = Object.freeze({ 's2.1-pro-free': 0, 's2.1-pro': 15, 's2-pro': 15, 's1': 15, 'drama-3': 10 });
+/** Speaker voice meaning "don't read this speaker's lines". */
+export const MUTED = '__muted__';
 
 export const DEFAULT_SETTINGS = Object.freeze({
     voiceMap: {},
@@ -32,6 +38,10 @@ export const DEFAULT_SETTINGS = Object.freeze({
     multi_speaker: true,
     cues: true,
     cue_prompt: false,
+    skip_markup: true,
+    skip_tags: 'infobox, status, stats',
+    read_narration: true,
+    smooth_slow: true,
     /** @type {SavedVoice[]} */
     savedVoices: [],
     /** @type {Speaker[]} */
@@ -336,7 +346,7 @@ export function splitSpeakerSegments(text) {
  * Builds a Fish request from speaker turns. Turns without a known voice use
  * the message's own voice. Neighbouring turns with the same voice merge.
  * @param {{speaker: string|null, text: string}[]} segments
- * @param {(name: string) => string|null} resolveVoice Speaker name to voice id
+ * @param {(name: string) => string|null} resolveVoice Speaker name to voice id, or MUTED to drop the turn
  * @param {string} defaultVoiceId The voice SillyTavern picked for this message
  * @returns {{voices: string[], text: string, turns: {voiceId: string, speaker: string|null, text: string}[]}}
  */
@@ -344,7 +354,9 @@ export function buildSpeakerRequest(segments, resolveVoice, defaultVoiceId) {
     /** @type {{voiceId: string, speaker: string|null, text: string}[]} */
     const turns = [];
     for (const segment of segments) {
-        const voiceId = (segment.speaker && resolveVoice(segment.speaker)) || defaultVoiceId;
+        const resolved = segment.speaker ? resolveVoice(segment.speaker) : null;
+        if (resolved === MUTED) continue;
+        const voiceId = resolved || defaultVoiceId;
         const prev = turns.at(-1);
         if (prev && prev.voiceId === voiceId) {
             prev.text = `${prev.text} ${segment.text}`;
@@ -386,6 +398,13 @@ const CUE_SOURCE = "\\[([A-Za-z][A-Za-z ,'\u2019-]{0,58}[A-Za-z])\\](?!\\()";
 const CUE_BRACKET_RE = new RegExp(CUE_SOURCE, 'g');
 const CUE_PAREN_RE = /\(([A-Za-z][A-Za-z -]{0,30}[A-Za-z])\)/g;
 
+/** Drama 3's word-level delivery tags. */
+export const DRAMA_TAGS = Object.freeze(['whisper', 'emphasis', 'soft', 'fast', 'slow', 'stress', 'forceful']);
+const PAIRED_TAG_RE = new RegExp(`<(${DRAMA_TAGS.join('|')})>([\\s\\S]*?)<\\/\\1>`, 'gi');
+const LONE_DRAMA_TAG_RE = new RegExp(`<\\/?(?:${DRAMA_TAGS.join('|')})>`, 'gi');
+/** Nearest S1/S2 cue for a Drama 3 tag. Tags without one keep just their words. */
+const PAIRED_TAG_CUES = { whisper: 'whispering', soft: 'soft tone', emphasis: 'emphasis' };
+
 /** Regex source for hiding cues in the chat display. Same shape as the cues rewritten for TTS. */
 export const CUE_DISPLAY_REGEX = `/ ?${CUE_SOURCE}/g`;
 
@@ -399,6 +418,14 @@ export const CUE_DISPLAY_REGEX = `/ ?${CUE_SOURCE}/g`;
 export function rewriteCues(text, model, enabled) {
     const known = (cue) => CUE_SET.has(cue.trim().toLowerCase());
     let out = String(text);
+    // Drama 3's word-level tags. Other models get the nearest cue, or plain words.
+    if (!enabled || model !== 'drama-3') {
+        out = out.replace(PAIRED_TAG_RE, (whole, tag, inner) => {
+            const cue = enabled ? PAIRED_TAG_CUES[tag.toLowerCase()] : null;
+            if (!cue) return inner;
+            return model === 's1' ? `(${cue}) ${inner}` : `[${cue}] ${inner}`;
+        }).replace(LONE_DRAMA_TAG_RE, '');
+    }
     if (!enabled) {
         out = out.replace(CUE_BRACKET_RE, '').replace(CUE_PAREN_RE, (whole, cue) => (known(cue) ? '' : whole));
     } else if (model === 's1') {
@@ -416,6 +443,18 @@ export function rewriteCues(text, model, enabled) {
  * @param {string} model
  */
 export function cueInstruction(model) {
+    if (model === 'drama-3') {
+        return [
+            'Voice cues: this story is read aloud by a text-to-speech voice actor.',
+            'Before a line of dialogue you may add a short direction in square brackets, written like a note to the actor:',
+            '[slow, dangerously quiet], [voice breaking], [laughing nervously].',
+            'Sounds and pauses go where they happen: [sighs], [short pause].',
+            'To change only some words, wrap them in <whisper>, <emphasis>, <soft>, <fast>, <slow>, <stress> or <forceful>,',
+            'like <whisper>don\'t move</whisper>.',
+            'Use them sparingly: at most one direction per line of dialogue, only where the delivery clearly changes, never in narration.',
+            'Do not escalate: irritation is not shouting, sadness is not sobbing, sarcasm is not laughter.',
+        ].join(' ');
+    }
     const examples = '[whispering], [laughing], [sighing], [angry], [soft tone], [break]';
     const vocabulary = model === 's1'
         ? `Use only these cues: ${CUE_TAGS.map(t => `[${t}]`).join(' ')}.`
@@ -427,4 +466,152 @@ export function cueInstruction(model) {
         'Use them sparingly: at most one cue per line of dialogue, only where the delivery clearly changes, never in narration.',
         'Do not escalate: irritation is not shouting, sadness is not sobbing, sarcasm is not laughter.',
     ].join(' ');
+}
+
+// What gets read.
+//
+// Runs before speaker detection and cue rewriting. Reasoning blocks are always
+// dropped. Infoboxes and markup are dropped by default: code blocks, HTML
+// comments, markdown tables, HTML block elements and any tags the user lists.
+// Remaining inline tags are stripped to their words, except Drama 3's.
+
+const REASONING_RE = /<(think|thinking|reasoning)\b[^>]*>[\s\S]*?(?:<\/\1>|$)/gi;
+const FENCE_RE = /(```|~~~)[\s\S]*?(?:\1|$)/g;
+const COMMENT_RE = /<!--[\s\S]*?(?:-->|$)/g;
+const TABLE_ROW_RE = /^[ \t]*\|.*\|[ \t]*$\n?/gm;
+const BLOCK_TAGS = Object.freeze(['div', 'details', 'table', 'section', 'aside', 'pre', 'style', 'script', 'figure',
+    'iframe', 'svg', 'form', 'select', 'nav', 'header', 'footer']);
+const INLINE_TAG_RE = new RegExp(`<\/?(?!(?:${DRAMA_TAGS.join('|')})\\b)[a-zA-Z][^>]*>`, 'g');
+const MD_LINK_RE = /\[([^\]\n]+)\]\([^)\n]*\)/g;
+
+/** @param {string} s */
+const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Tag names from a comma or space separated list. Drama 3's tags are never skipped.
+ * @param {string} list
+ */
+export function parseTagList(list) {
+    return [...new Set(String(list ?? '').split(/[\s,]+/)
+        .map(t => t.replace(/[<>/]/g, '').trim().toLowerCase())
+        .filter(t => /^[a-z][a-z0-9_-]{0,30}$/.test(t) && !DRAMA_TAGS.includes(t)))];
+}
+
+/**
+ * Removes whole elements, nested ones included: `<div>…<div>…</div>…</div>`.
+ * An element left open runs to the end of the text, as an infobox cut off by the reply limit would.
+ * @param {string} text
+ * @param {string[]} names
+ */
+export function removeTagBlocks(text, names) {
+    if (!names.length) return text;
+    const re = new RegExp(`<(\/?)(${names.map(escapeRegex).join('|')})\\b[^>]*?(\/?)>`, 'gi');
+    let out = '';
+    let last = 0;
+    let depth = 0;
+    let current = '';
+    for (const match of text.matchAll(re)) {
+        const [whole, closing, name, selfClosing] = match;
+        const tag = name.toLowerCase();
+        if (depth === 0) {
+            if (closing) continue;
+            out += text.slice(last, match.index);
+            last = match.index + whole.length;
+            if (!selfClosing) {
+                depth = 1;
+                current = tag;
+            }
+        } else if (tag === current && !selfClosing) {
+            depth += closing ? -1 : 1;
+            if (depth === 0) last = match.index + whole.length;
+        }
+    }
+    return depth > 0 ? out : out + text.slice(last);
+}
+
+/**
+ * @param {string} text
+ * @param {{skipMarkup?: boolean, extraTags?: string[]}} [options]
+ */
+export function removeUnspoken(text, { skipMarkup = true, extraTags = [] } = {}) {
+    let out = String(text).replace(REASONING_RE, '');
+    if (skipMarkup) {
+        out = out.replace(FENCE_RE, '\n').replace(COMMENT_RE, ' ');
+        out = removeTagBlocks(out, [...BLOCK_TAGS, ...extraTags]);
+        out = out.replace(TABLE_ROW_RE, '');
+    } else if (extraTags.length) {
+        out = removeTagBlocks(out, extraTags);
+    }
+    return out.replace(INLINE_TAG_RE, '').replace(MD_LINK_RE, '$1').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// Dialogue only. Quoted text is dialogue anywhere. A speaker line without
+// quotes ("Alice: Hi there") is dialogue too, script style. Everything else is narration.
+const QUOTE_RE = /"[^"\n]+"|“[^”\n]+”|«[^»\n]+»|「[^」\n]+」|『[^』\n]+』/g;
+const LEADING_MARK_RE = new RegExp(`^(\\s*)(${MARK_OPEN}([^${MARK_CLOSE}]{1,40})${MARK_CLOSE} ?)?([\\s\\S]*)$`);
+
+/**
+ * Keeps only dialogue. Speaker markers stay, so voices still switch.
+ * @param {string} text Text after markSpeakerLines (or plain text)
+ */
+export function keepDialogue(text) {
+    return String(text).split('\n').map((line) => {
+        const [, , marker = '', name, rest] = LEADING_MARK_RE.exec(line) ?? [];
+        const quotes = (rest ?? '').match(QUOTE_RE);
+        if (quotes) return `${marker}${quotes.join(' ')}`;
+        if (name && name !== DEFAULT_SPEAKER && rest.trim()) return `${marker}${rest}`;
+        return '';
+    }).filter(line => line.trim()).join('\n');
+}
+
+// Smooth playback for slow models: whole sentences, generated ahead in
+// parallel, each played once complete. All chunks start generating together,
+// so chunk N is ready after about len(N)/speed while it is needed only after
+// chunks 1..N-1 have played. Growing each chunk by at most ~1.6x the previous
+// one keeps it ready in time at Drama 3's measured 0.6-1x real-time speed. The
+// first chunk is one short sentence so audio starts soon.
+const SENTENCE_RE = /[^.!?…。！？]+(?:[.!?…。！？]+["”’»」』)\]*]*|$)\s*/g;
+const CLAUSE_RE = /[^,;:、，]+(?:[,;:、，]+\s*|$)/g;
+const DRAMA_OPEN_RE = new RegExp(`<(?:${DRAMA_TAGS.join('|')})>`, 'gi');
+const DRAMA_CLOSE_RE = new RegExp(`<\\/(?:${DRAMA_TAGS.join('|')})>`, 'gi');
+
+/** @param {string} s */
+const tagsBalanced = (s) => (s.match(DRAMA_OPEN_RE)?.length ?? 0) === (s.match(DRAMA_CLOSE_RE)?.length ?? 0);
+
+/**
+ * @param {string} text
+ * @param {{first?: number, growth?: number, max?: number}} [options]
+ * @returns {string[]}
+ */
+export function splitIntoChunks(text, { first = 30, growth = 1.6, max = 300 } = {}) {
+    // Sentences, with very long ones broken at commas.
+    const pieces = (String(text).match(SENTENCE_RE) ?? [])
+        .flatMap(s => (s.length > max ? (s.match(CLAUSE_RE) ?? [s]) : [s]))
+        .filter(s => s.trim());
+    const chunks = [];
+    let current = '';
+    let limit = first;
+    for (const piece of pieces) {
+        const full = chunks.length === 0 ? current.length >= first : current.length + piece.length > limit;
+        if (current && full && tagsBalanced(current)) {
+            chunks.push(current.trim());
+            limit = Math.min(max, Math.max(60, Math.round(current.trim().length * growth)));
+            current = '';
+        }
+        current += piece;
+    }
+    if (current.trim()) chunks.push(current.trim());
+    return chunks;
+}
+
+/**
+ * Rough cost of reading some text on a model.
+ * @param {string} text
+ * @param {string} model
+ * @returns {{bytes: number, usd: number|null}}
+ */
+export function estimateCost(text, model) {
+    const bytes = new TextEncoder().encode(String(text)).length;
+    const price = MODEL_PRICES[model];
+    return { bytes, usd: price === undefined ? null : bytes * price / 1e6 };
 }

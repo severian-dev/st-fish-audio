@@ -12,21 +12,28 @@ import {
     compareVersions,
     CUE_DISPLAY_REGEX,
     cueInstruction,
+    estimateCost,
     formatBytes,
     formatCredit,
     hasSpeakerMarks,
     isVoiceId,
+    keepDialogue,
     markSpeakerLines,
     mergeSettings,
     MIN_PLUGIN_VERSION,
     MODEL_LABELS,
     MULTI_SPEAKER_MODELS,
+    MUTED,
+    parseTagList,
     parseVoiceInput,
     PLUGIN_BASE,
     PROVIDER_NAME,
+    removeUnspoken,
     rewriteCues,
     SECRET_KEY,
     SILENCE_URL,
+    SLOW_MODELS,
+    splitIntoChunks,
     splitSpeakerSegments,
     toSavedVoice,
 } from './lib.js';
@@ -117,6 +124,24 @@ const SETTINGS_HTML = `
             <div id="fat_cache_clear" class="menu_button" title="Delete cached audio from the server">Clear</div>
         </div>
     </div>
+    <label class="checkbox_label" for="fat_smooth_slow">
+        <input id="fat_smooth_slow" type="checkbox">
+        <span>Smooth playback for Drama 3 (prepares sentences ahead so playback doesn't stutter)</span>
+    </label>
+    <div id="fat_warnings" class="fat-warnings"></div>
+    <h4 class="fat-heading">What gets read</h4>
+    <label class="checkbox_label" for="fat_read_narration">
+        <input id="fat_read_narration" type="checkbox">
+        <span>Read narration (off reads only dialogue: quoted text and <code>Name:</code> lines)</span>
+    </label>
+    <label class="checkbox_label" for="fat_skip_markup">
+        <input id="fat_skip_markup" type="checkbox">
+        <span>Skip infoboxes and markup (code blocks, tables, HTML blocks, comments)</span>
+    </label>
+    <label for="fat_skip_tags">Also skip these tags</label>
+    <input id="fat_skip_tags" type="text" class="text_pole" placeholder="infobox, status, stats">
+    <small>Reasoning blocks like <code>&lt;think&gt;</code> are never read. Mute a speaker in the list below.
+    Preview last message shows what will be read and what it costs.</small>
     <h4 class="fat-heading">Voices</h4>
     <small>Saved voices show up in the voice map. Your own Fish voices are added automatically.</small>
     <div class="flex-container flexGap5">
@@ -177,11 +202,30 @@ export class FishAudioTtsProvider {
     /** SillyTavern clears extension prompts whenever a chat loads, so the cue instruction is re-applied. */
     reapplyCuePrompt = () => this.applyCuePrompt();
 
+    /** SillyTavern TTS options that undo what this provider does, with what to use instead. */
+    renderWarnings() {
+        const box = document.getElementById('fat_warnings');
+        if (!box) return;
+        const tts = SillyTavern.getContext().extensionSettings.tts ?? {};
+        const warnings = [];
+        if (tts.skip_tags && this.settings.model === 'drama-3') {
+            warnings.push('"Skip <tagged> blocks" above deletes the words inside Drama 3 tags like <whisper>. Turn it off and use "Skip infoboxes" below.');
+        }
+        if (tts.narrate_quoted_only && this.settings.multi_speaker) {
+            warnings.push('"Only narrate quotes" above drops Name: labels, so speakers can\'t get their own voices. Turn it off and untick "Read narration" below.');
+        }
+        if (tts.multi_voice_enabled && this.settings.multi_speaker) {
+            warnings.push('"Different voices for quotes" above splits lines before speakers are found. Turn it off to use the Speakers list.');
+        }
+        box.replaceChildren(...warnings.map(w => Object.assign(document.createElement('div'), { className: 'fat-warning', textContent: w })));
+    }
+
     dispose() {
         this.previewAudio.pause();
         const { eventSource, eventTypes, setExtensionPrompt } = SillyTavern.getContext();
         eventSource.removeListener(eventTypes.CHAT_CHANGED, this.reapplyCuePrompt);
         eventSource.removeListener(eventTypes.GENERATION_STARTED, this.reapplyCuePrompt);
+        $(document).off('change.fat');
         setExtensionPrompt(CUE_PROMPT_KEY, '', IN_CHAT, 1, false, SYSTEM_ROLE);
     }
 
@@ -241,6 +285,7 @@ export class FishAudioTtsProvider {
         this.refreshCache();
         this.renderSavedVoices();
         this.renderSpeakers();
+        this.renderWarnings();
         this.applyCuePrompt();
         const { eventSource, eventTypes } = SillyTavern.getContext();
         eventSource.on(eventTypes.CHAT_CHANGED, this.reapplyCuePrompt);
@@ -298,12 +343,14 @@ export class FishAudioTtsProvider {
      * @param {string} text
      */
     async processText(text) {
-        let out = text;
-        if (this.settings.multi_speaker) {
+        const s = this.settings;
+        let out = removeUnspoken(text, { skipMarkup: s.skip_markup, extraTags: parseTagList(s.skip_tags) });
+        if (s.multi_speaker) {
             if (!this.voices.length) await this.fetchTtsVoiceObjects();
-            out = markSpeakerLines(out, (name) => Boolean(this.speakerVoiceId(name)));
+            out = markSpeakerLines(out, (name) => this.speakerVoiceId(name) !== null);
         }
-        return rewriteCues(out, this.settings.model, this.settings.cues);
+        if (!s.read_narration) out = keepDialogue(out);
+        return rewriteCues(out, s.model, s.cues);
     }
 
     /**
@@ -312,10 +359,19 @@ export class FishAudioTtsProvider {
      * @returns {Promise<string|AsyncGenerator<string>>} URL that streams the audio, or one URL per turn
      */
     async generateTts(text, voiceId) {
-        if (!hasSpeakerMarks(text)) return this.requestTts(text, voiceId);
+        const request = hasSpeakerMarks(text)
+            ? buildSpeakerRequest(splitSpeakerSegments(text), (name) => this.speakerVoiceId(name), voiceId)
+            : { voices: [voiceId], text, turns: [{ voiceId, speaker: null, text }] };
+        if (!request.turns.length || !request.text.trim()) return SILENCE_URL;
 
-        const request = buildSpeakerRequest(splitSpeakerSegments(text), (name) => this.speakerVoiceId(name), voiceId);
-        if (!request.turns.length) return SILENCE_URL;
+        // Drama 3 generates at about real time or slower, so one long streamed
+        // clip can stall mid-sentence. Instead the text goes out as sentence
+        // chunks, all generating at once. The short first chunk starts playing
+        // soon, and each later one has had a head start by the time it plays.
+        if (this.settings.smooth_slow && SLOW_MODELS.includes(this.settings.model)) {
+            const chunks = request.turns.flatMap(t => splitIntoChunks(t.text).map(chunk => ({ text: chunk, voiceId: t.voiceId })));
+            return this.smoothStream(chunks);
+        }
         if (request.voices.length === 1) return this.requestTts(request.text, request.voices[0]);
         if (MULTI_SPEAKER_MODELS.includes(this.settings.model)) return this.requestTts(request.text, request.voices);
 
@@ -324,6 +380,30 @@ export class FishAudioTtsProvider {
         return (async function* () {
             for (const turn of request.turns) yield await self.requestTts(turn.text, turn.voiceId);
         })();
+    }
+
+    /**
+     * Starts chunks a few at a time, ahead of playback, and yields their
+     * stream URLs in order.
+     * @param {{text: string, voiceId: string}[]} chunks
+     */
+    async *smoothStream(chunks) {
+        // The plugin allows 5 Fish requests at once, so 4 ahead leaves room for previews.
+        const AHEAD = 4;
+        /** @type {Promise<string>[]} */
+        const started = [];
+        const startMore = (played) => {
+            while (started.length < chunks.length && started.length < played + AHEAD) {
+                const chunk = chunks[started.length];
+                const promise = this.requestTts(chunk.text, chunk.voiceId);
+                promise.catch(() => {}); // awaited in order below
+                started.push(promise);
+            }
+        };
+        for (let i = 0; i < chunks.length; i++) {
+            startMore(i);
+            yield await started[i];
+        }
     }
 
     /**
@@ -347,6 +427,7 @@ export class FishAudioTtsProvider {
     /**
      * Voice id for a speaker name: the Speakers list first, then SillyTavern's
      * voice map (group members, the character itself). Case-insensitive.
+     * MUTED for speakers muted in the list or disabled in the voice map.
      * @param {string} name
      * @returns {string|null}
      */
@@ -355,14 +436,15 @@ export class FishAudioTtsProvider {
         const byLabel = (label) => this.voices.find(v => v.name === label)?.voice_id ?? null;
 
         const listed = this.settings.speakers.find(s => s.name.trim().toLowerCase() === wanted);
-        if (listed) return byLabel(listed.voice);
+        if (listed) return listed.voice === MUTED ? MUTED : byLabel(listed.voice);
 
         const map = this.settings.voiceMap ?? {};
         const key = Object.keys(map).find(k => k.toLowerCase() === wanted);
         if (!key) return null;
         let label = map[key];
         if (label === DEFAULT_VOICE_MARKER) label = map[DEFAULT_VOICE_MARKER];
-        if (!label || label === DISABLED_VOICE_MARKER || label === DEFAULT_VOICE_MARKER) return null;
+        if (label === DISABLED_VOICE_MARKER) return MUTED;
+        if (!label || label === DEFAULT_VOICE_MARKER) return null;
         return byLabel(label);
     }
 
@@ -523,8 +605,8 @@ export class FishAudioTtsProvider {
             });
             const voice = document.createElement('select');
             voice.className = 'text_pole flex1';
-            const options = labels.includes(speaker.voice) || !speaker.voice ? labels : [speaker.voice, ...labels];
-            voice.append(new Option('Pick a voice', ''), ...options.map(l => new Option(l, l)));
+            const options = labels.includes(speaker.voice) || !speaker.voice || speaker.voice === MUTED ? labels : [speaker.voice, ...labels];
+            voice.append(new Option('Pick a voice', ''), new Option('Muted (not read)', MUTED), ...options.map(l => new Option(l, l)));
             voice.value = speaker.voice;
             voice.addEventListener('change', () => {
                 speaker.voice = voice.value;
@@ -548,7 +630,23 @@ export class FishAudioTtsProvider {
         $('#fat_speakers input').last().trigger('focus');
     }
 
-    /** Shows how the last chat message would be split between voices. Generates nothing. */
+    /**
+     * What SillyTavern's TTS does to a message before processText, roughly,
+     * so the preview matches what gets read.
+     * @param {string} mes
+     */
+    coreLikePrep(mes) {
+        const tts = SillyTavern.getContext().extensionSettings.tts ?? {};
+        let text = String(mes);
+        if (tts.skip_codeblocks) text = text.replace(/```.*?```/gs, '').replace(/~~~.*?~~~/gs, '');
+        if (tts.skip_tags) text = text.replace(/<.*?>[\s\S]*?<\/.*?>/g, '');
+        if (!tts.pass_asterisks) {
+            text = tts.narrate_dialogues_only ? text.replace(/\*[^*]*?(\*|$)/g, '') : text.replaceAll('*', '');
+        }
+        return text;
+    }
+
+    /** Shows what the last chat message would read, in which voices, and the rough cost. Generates nothing. */
     async previewLastMessage() {
         const { chat, callGenericPopup, POPUP_TYPE } = SillyTavern.getContext();
         const message = [...(chat ?? [])].reverse().find(m => !m.is_system && m.mes);
@@ -557,14 +655,20 @@ export class FishAudioTtsProvider {
             return;
         }
         if (!this.voices.length) await this.fetchTtsVoiceObjects();
-        const marked = markSpeakerLines(String(message.mes).replaceAll('*', ''), (name) => Boolean(this.speakerVoiceId(name)));
+        const spoken = (await this.processText(this.coreLikePrep(message.mes))).replace(/\s+/g, ' ').trim();
+        const own = '__message__';
+        const request = hasSpeakerMarks(spoken)
+            ? buildSpeakerRequest(splitSpeakerSegments(spoken), (name) => this.speakerVoiceId(name), own)
+            : { voices: spoken ? [own] : [], turns: spoken ? [{ voiceId: own, speaker: null, text: spoken }] : [] };
         const fallback = this.settings.voiceMap?.[message.name] ?? DEFAULT_VOICE_MARKER;
-        const request = buildSpeakerRequest(splitSpeakerSegments(marked), (name) => this.speakerVoiceId(name), '__message__');
-        const voiceName = (id) => (id === '__message__' ? `${message.name}'s voice (${fallback})` : this.voices.find(v => v.voice_id === id)?.name ?? id);
+        const voiceName = (id) => (id === own ? `${message.name}'s voice (${fallback})` : this.voices.find(v => v.voice_id === id)?.name ?? id);
 
         const root = document.createElement('div');
         root.className = 'fat-preview';
-        root.append(Object.assign(document.createElement('h3'), { textContent: `Voices for ${message.name}'s last message` }));
+        root.append(Object.assign(document.createElement('h3'), { textContent: `What gets read from ${message.name}'s last message` }));
+        if (!request.turns.length) {
+            root.append(Object.assign(document.createElement('div'), { textContent: 'Nothing. Every part of this message is skipped or muted.' }));
+        }
         for (const turn of request.turns) {
             const row = document.createElement('div');
             row.className = 'fat-preview-turn';
@@ -574,12 +678,20 @@ export class FishAudioTtsProvider {
             );
             root.append(row);
         }
-        const note = !this.settings.multi_speaker
-            ? 'Several voices is off, so the whole message uses one voice.'
-            : request.voices.length > 1 && !MULTI_SPEAKER_MODELS.includes(this.settings.model)
-                ? 'This model can\'t mix voices in one request, so each turn is sent on its own.'
-                : request.voices.length > 1 ? `${request.voices.length} voices, sent as one request.` : 'One voice for the whole message.';
-        root.append(Object.assign(document.createElement('small'), { textContent: note }));
+        const model = this.settings.model;
+        const cost = estimateCost(request.turns.map(t => t.text).join(' '), model);
+        const price = cost.usd === null ? '' : cost.usd === 0 ? ', free on this model' : `, about $${cost.usd.toFixed(4)} on this model`;
+        const original = estimateCost(String(message.mes), model).bytes;
+        const notes = [`${cost.bytes} of ${original} bytes read${price}.`];
+        if (!this.settings.multi_speaker) notes.push('Several voices is off, so the whole message uses one voice.');
+        else if (request.voices.length > 1) {
+            notes.push(MULTI_SPEAKER_MODELS.includes(model)
+                ? `${request.voices.length} voices, sent as one request.`
+                : 'This model can\'t mix voices in one request, so each turn is sent on its own.');
+        }
+        if (this.settings.smooth_slow && SLOW_MODELS.includes(model)) notes.push('Drama 3 sends it sentence by sentence, prepared ahead.');
+        if (model === 'drama-3') notes.push('Drama 3\'s price isn\'t published. The estimate uses $10 per 1M bytes, measured in October 2026.');
+        root.append(Object.assign(document.createElement('small'), { textContent: notes.join(' ') }));
         await callGenericPopup(root, POPUP_TYPE.TEXT, '', { wide: true, allowVerticalScrolling: true });
     }
 
@@ -680,6 +792,21 @@ export class FishAudioTtsProvider {
             s.model = String($model.val());
             saveTtsProviderSettings();
             this.applyCuePrompt();
+            this.renderWarnings();
+        });
+        // SillyTavern's own TTS options can undo ours, so warnings follow them.
+        $(document).off('change.fat').on('change.fat', '#tts_skip_tags, #tts_narrate_quoted, #tts_multi_voice_enabled', () => {
+            setTimeout(() => this.renderWarnings(), 0);
+        });
+        for (const key of ['smooth_slow', 'read_narration', 'skip_markup']) {
+            $(`#fat_${key}`).prop('checked', s[key]).on('change', (e) => {
+                s[key] = Boolean($(e.currentTarget).prop('checked'));
+                saveTtsProviderSettings();
+            });
+        }
+        $('#fat_skip_tags').val(s.skip_tags).on('input', (e) => {
+            s.skip_tags = String($(e.currentTarget).val());
+            saveTtsProviderSettings();
         });
         $('#fat_latency').val(s.latency).on('change', function () {
             s.latency = String($(this).val());
@@ -702,9 +829,10 @@ export class FishAudioTtsProvider {
             saveTtsProviderSettings();
         });
         $('#fat_cache_clear').on('click', () => this.clearCache());
-        $('#fat_multi_speaker').prop('checked', s.multi_speaker).on('change', function () {
-            s.multi_speaker = Boolean($(this).prop('checked'));
+        $('#fat_multi_speaker').prop('checked', s.multi_speaker).on('change', (e) => {
+            s.multi_speaker = Boolean($(e.currentTarget).prop('checked'));
             saveTtsProviderSettings();
+            this.renderWarnings();
         });
         $('#fat_speaker_add').on('click', () => this.addSpeaker());
         $('#fat_cues').prop('checked', s.cues).on('change', function () {
