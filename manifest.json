@@ -7,7 +7,7 @@
     "js": "index.js",
     "css": "style.css",
     "author": "severian-dev",
-    "version": "0.1.0",
+    "version": "0.2.0",
     "homePage": "https://github.com/severian-dev/st-fish-audio",
     "description": "Fish Audio voices for SillyTavern's built-in TTS. Needs the st-fish-audio-plugin server plugin.",
     "auto_update": true

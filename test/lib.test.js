@@ -6,6 +6,8 @@ import {
     buildTtsBody,
     buildVoiceObjects,
     compareVersions,
+    CUE_DISPLAY_REGEX,
+    cueInstruction,
     DEFAULT_SETTINGS,
     formatBytes,
     formatCredit,
@@ -13,6 +15,7 @@ import {
     markSpeakerLines,
     mergeSettings,
     parseVoiceInput,
+    rewriteCues,
     sanitizeLabel,
     splitSpeakerSegments,
     stableSample,
@@ -192,5 +195,36 @@ describe('several voices per message', () => {
     it('marks survive whitespace collapse and strip cleanly', () => {
         const marked = markSpeakerLines('Alice: Hi.\nThen silence.', known);
         assert.equal(stripSpeakerMarks(marked.replace(/\s+/g, ' ')), 'Hi. Then silence.');
+    });
+});
+
+describe('voice cues', () => {
+    const text = 'Alice: [angry] "Get out!" (sighing)\n[OOC: test] see [the link](http://x) [1]\nShe [tense, quiet voice] spoke. (aside)';
+
+    it('keeps brackets for S2 and converts known legacy tags', () => {
+        assert.equal(rewriteCues(text, 's2.1-pro-free', true),
+            'Alice: [angry] "Get out!" [sighing]\n[OOC: test] see [the link](http://x) [1]\nShe [tense, quiet voice] spoke. (aside)');
+    });
+
+    it('keeps only known tags for S1, in parentheses', () => {
+        assert.equal(rewriteCues(text, 's1', true),
+            'Alice: (angry) "Get out!" (sighing)\n[OOC: test] see [the link](http://x) [1]\nShe spoke. (aside)');
+    });
+
+    it('removes cues when turned off and leaves other brackets', () => {
+        assert.equal(rewriteCues(text, 's2.1-pro', false),
+            'Alice: "Get out!"\n[OOC: test] see [the link](http://x) [1]\nShe spoke. (aside)');
+    });
+
+    it('builds a model-aware instruction', () => {
+        assert.match(cueInstruction('s2.1-pro-free'), /free-form/);
+        assert.match(cueInstruction('s1'), /Use only these cues: \[happy\]/);
+        assert.equal(cueInstruction('s1').includes('—'), false);
+    });
+
+    it('display regex hides the same cues', () => {
+        const [, body, flags] = /^\/(.*)\/(\w*)$/.exec(CUE_DISPLAY_REGEX);
+        const re = new RegExp(body, flags);
+        assert.equal('She [whispering] spoke. [OOC: keep] [link](x)'.replace(re, ''), 'She spoke. [OOC: keep] [link](x)');
     });
 });

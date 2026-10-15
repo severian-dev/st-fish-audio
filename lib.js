@@ -1,6 +1,8 @@
 // Pure helpers for the Fish Audio TTS extension.
 // No SillyTavern imports here so the functions can be unit-tested under Node.
 
+// Distinct from "Fish Audio" so this never clashes with a core provider of that name.
+export const PROVIDER_NAME = 'Fish Audio (Extension)';
 export const PLUGIN_BASE = '/api/plugins/fish-audio';
 export const SILENCE_URL = '/sounds/silence.mp3';
 export const SECRET_KEY = 'api_key_fish_audio';
@@ -28,6 +30,8 @@ export const DEFAULT_SETTINGS = Object.freeze({
     normalize_loudness: true,
     cache_audio: true,
     multi_speaker: true,
+    cues: true,
+    cue_prompt: false,
     /** @type {SavedVoice[]} */
     savedVoices: [],
     /** @type {Speaker[]} */
@@ -353,4 +357,74 @@ export function buildSpeakerRequest(segments, resolveVoice, defaultVoiceId) {
         ? turns.map(t => t.text).join(' ')
         : turns.map(t => `<|speaker:${voices.indexOf(t.voiceId)}|>${t.text}`).join('');
     return { voices, text, turns };
+}
+
+// Emotion and delivery cues.
+//
+// S2 models and Drama 3 read [bracket] cues, free-form. S1 reads a fixed set
+// of (parenthesis) tags and speaks anything else aloud. Cues are written in
+// brackets and rewritten here for the selected model.
+
+/** Fish's documented tag set, shared by S1 (in parentheses) and S2 (in brackets). */
+export const CUE_TAGS = Object.freeze([
+    'happy', 'sad', 'angry', 'excited', 'calm', 'nervous', 'confident', 'surprised', 'satisfied', 'delighted',
+    'scared', 'worried', 'upset', 'frustrated', 'depressed', 'empathetic', 'embarrassed', 'disgusted', 'moved',
+    'proud', 'relaxed', 'grateful', 'curious', 'sarcastic',
+    'disdainful', 'unhappy', 'anxious', 'hysterical', 'indifferent', 'uncertain', 'doubtful', 'confused',
+    'disappointed', 'regretful', 'guilty', 'ashamed', 'jealous', 'envious', 'hopeful', 'optimistic', 'pessimistic',
+    'nostalgic', 'lonely', 'bored', 'contemptuous', 'sympathetic', 'compassionate', 'determined', 'resigned',
+    'in a hurry tone', 'shouting', 'screaming', 'whispering', 'soft tone', 'emphasis',
+    'laughing', 'chuckling', 'sobbing', 'crying loudly', 'sighing', 'groaning', 'panting', 'gasping', 'yawning',
+    'snoring', 'clear throat',
+    'audience laughing', 'background laughter', 'crowd laughing', 'break', 'long-break',
+]);
+const CUE_SET = new Set(CUE_TAGS);
+
+// A cue-like bracket: starts and ends with a letter, words, spaces, commas,
+// apostrophes and hyphens only. "[OOC: ...]", "[1]" and markdown links "[text](url)" don't match.
+const CUE_SOURCE = "\\[([A-Za-z][A-Za-z ,'\u2019-]{0,58}[A-Za-z])\\](?!\\()";
+const CUE_BRACKET_RE = new RegExp(CUE_SOURCE, 'g');
+const CUE_PAREN_RE = /\(([A-Za-z][A-Za-z -]{0,30}[A-Za-z])\)/g;
+
+/** Regex source for hiding cues in the chat display. Same shape as the cues rewritten for TTS. */
+export const CUE_DISPLAY_REGEX = `/ ?${CUE_SOURCE}/g`;
+
+/**
+ * Rewrites cues for the model that will speak them. With cues off, every
+ * cue-like bracket and every known (tag) is removed so nothing is read aloud.
+ * @param {string} text
+ * @param {string} model
+ * @param {boolean} enabled
+ */
+export function rewriteCues(text, model, enabled) {
+    const known = (cue) => CUE_SET.has(cue.trim().toLowerCase());
+    let out = String(text);
+    if (!enabled) {
+        out = out.replace(CUE_BRACKET_RE, '').replace(CUE_PAREN_RE, (whole, cue) => (known(cue) ? '' : whole));
+    } else if (model === 's1') {
+        // S1 speaks unknown cues aloud, so only tags from its fixed set survive, in parentheses.
+        out = out.replace(CUE_BRACKET_RE, (whole, cue) => (known(cue) ? `(${cue.trim().toLowerCase()})` : ''));
+    } else {
+        // S2 and Drama 3: brackets as written, legacy (tag) cues converted.
+        out = out.replace(CUE_PAREN_RE, (whole, cue) => (known(cue) ? `[${cue.trim().toLowerCase()}]` : whole));
+    }
+    return out.replace(/[ \t]{2,}/g, ' ').replace(/[ \t]+$/gm, '');
+}
+
+/**
+ * Instruction for the chat model, injected into the prompt when the user turns it on.
+ * @param {string} model
+ */
+export function cueInstruction(model) {
+    const examples = '[whispering], [laughing], [sighing], [angry], [soft tone], [break]';
+    const vocabulary = model === 's1'
+        ? `Use only these cues: ${CUE_TAGS.map(t => `[${t}]`).join(' ')}.`
+        : `Cues can be short free-form descriptions like [tense, quiet voice], or simple tags like ${examples}.`;
+    return [
+        'Voice cues: this story is read aloud by a text-to-speech voice.',
+        'Inside spoken dialogue you may put a short delivery cue in square brackets right before the words it shapes.',
+        vocabulary,
+        'Use them sparingly: at most one cue per line of dialogue, only where the delivery clearly changes, never in narration.',
+        'Do not escalate: irritation is not shouting, sadness is not sobbing, sarcasm is not laughter.',
+    ].join(' ');
 }

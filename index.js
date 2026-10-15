@@ -3,10 +3,8 @@
 // provider needs the st-fish-audio-plugin server plugin for synthesis.
 
 import { registerTtsProvider } from '../../tts/index.js';
+import { PROVIDER_NAME } from './lib.js';
 import { FishAudioTtsProvider } from './provider.js';
-
-// Distinct from "Fish Audio" so this never clashes with a core provider of that name.
-const PROVIDER_NAME = 'Fish Audio (Extension)';
 
 try {
     registerTtsProvider(PROVIDER_NAME, FishAudioTtsProvider);

@@ -1,7 +1,8 @@
 # Fish Audio TTS
 
 [Fish Audio](https://fish.audio) voices in SillyTavern's built-in TTS. Narration modes, the voice map, `/speak` and
-the narrate buttons work as usual. Adds a voice browser with free sample playback.
+the narrate buttons work as usual. Adds a voice browser with free sample playback, several voices in one message,
+emotion cues, and an audio cache so repeated lines cost nothing.
 
 Two parts: this extension and a small [server plugin](https://github.com/severian-dev/st-fish-audio-plugin). Fish's
 speech API does not accept calls from a browser, so the plugin makes them from the SillyTavern server. Your API key
@@ -30,6 +31,45 @@ Tested on SillyTavern 1.19.0.
 - Your own Fish voices show up automatically.
 - Saved voices appear in the voice map. Pick one per character.
 
+## Several voices in one message
+
+Lines that start with a known name use that character's voice:
+
+```
+The door opened slowly.
+Alice: "Who goes there?"
+Old Tom: "Just me."
+She stepped back.
+```
+
+Alice and Old Tom get their own voices, the narration keeps the message's voice. Names come from the voice map
+(characters in the chat) and from the **Speakers** list, which is where NPCs go. Each line stands alone: a line without
+a known name goes back to the message's voice. "Note:" or "Time:" lines are left alone unless you add those names.
+
+S2 models and Drama 3 voice the whole message in one request. S1 gets one clip per speaker turn.
+
+**Preview last message** shows how the latest message splits, without generating anything.
+
+Turn off SillyTavern's "Only narrate quotes" and "Different voices for quotes" for this to work. Both strip or split
+the lines before the extension sees them.
+
+## Voice cues
+
+S2 models and Drama 3 read delivery cues in square brackets: `[whispering]`, `[laughing]`, `[sighing]`, or free-form
+ones like `[tense, quiet voice]`. S1 only knows a fixed set of tags. The extension rewrites cues for the selected model
+and drops the ones it can't read.
+
+- **Use cues.** On by default. Off removes them before speaking.
+- **Ask the chat model to write cues.** Adds a short instruction to the prompt while TTS is on with this provider.
+- **Hide cues in the chat.** Adds a display-only regex script, "Fish Audio TTS: hide voice cues". Messages keep the
+  cues, TTS still reads them, you just don't see them. Untick to remove the script.
+
+## Audio cache
+
+The plugin keeps generated audio on the SillyTavern server, per user. A line spoken again with the same voice and
+settings replays from disk instead of costing credit. Up to 200 MB per user, oldest first. Turn it off or clear it in
+the settings.
+
 ## Models
 
 | Model | Cost | Notes |
@@ -52,6 +92,10 @@ Paid models use API credit, which is separate from fish.audio app credit. The se
 | Temperature | 0.7 | Higher is more varied. |
 | Top P | 0.7 | |
 | Even out loudness | on | S2 models only. |
+| Reuse audio | on | Needs plugin 0.2.0 or newer. |
+| Several voices per message | on | |
+| Use cues | on | |
+| Ask the chat model to write cues | off | |
 
 ## How it works
 
@@ -60,6 +104,8 @@ Paid models use API credit, which is separate from fish.audio app credit. The se
   job id as soon as Fish accepts, then streams the MP3 as Fish produces it. Playback starts on the first chunk.
 - Only models on a fixed list are sent. Fish bills a missing or unknown model as S2.1 Pro.
 - At most 5 requests at once per key, Fish's base limit. Busy answers are retried.
+- Speaker lines are found in `processText`, before SillyTavern collapses line breaks, and turned into Fish's
+  `<|speaker:N|>` turns with one voice per speaker.
 - The key lives in SillyTavern's secrets store as `api_key_fish_audio`.
 
 ## Fish's rules

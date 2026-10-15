@@ -10,6 +10,8 @@ import {
     buildTtsBody,
     buildVoiceObjects,
     compareVersions,
+    CUE_DISPLAY_REGEX,
+    cueInstruction,
     formatBytes,
     formatCredit,
     hasSpeakerMarks,
@@ -21,6 +23,8 @@ import {
     MULTI_SPEAKER_MODELS,
     parseVoiceInput,
     PLUGIN_BASE,
+    PROVIDER_NAME,
+    rewriteCues,
     SECRET_KEY,
     SILENCE_URL,
     splitSpeakerSegments,
@@ -30,6 +34,12 @@ import {
 // SillyTavern's voice map markers.
 const DEFAULT_VOICE_MARKER = '[Default Voice]';
 const DISABLED_VOICE_MARKER = 'disabled';
+// SillyTavern prompt injection: in chat, depth 1, system role.
+const CUE_PROMPT_KEY = 'fish_audio_tts_cues';
+const IN_CHAT = 1;
+const SYSTEM_ROLE = 0;
+const CUE_SCRIPT_NAME = 'Fish Audio TTS: hide voice cues';
+const AI_OUTPUT = 2;
 
 const OWN_VOICES_TTL_MS = 5 * 60_000;
 const PLUGIN_URL = 'https://github.com/severian-dev/st-fish-audio-plugin';
@@ -130,6 +140,20 @@ const SETTINGS_HTML = `
         <div id="fat_speaker_add" class="menu_button menu_button_icon"><i class="fa-solid fa-plus"></i><span>Add name</span></div>
         <div id="fat_speaker_preview" class="menu_button menu_button_icon"><i class="fa-solid fa-eye"></i><span>Preview last message</span></div>
     </div>
+    <h4 class="fat-heading">Voice cues</h4>
+    <label class="checkbox_label" for="fat_cues">
+        <input id="fat_cues" type="checkbox">
+        <span>Use cues like <code>[whispering]</code> (off removes them before speaking)</span>
+    </label>
+    <label class="checkbox_label" for="fat_cue_prompt">
+        <input id="fat_cue_prompt" type="checkbox">
+        <span>Ask the chat model to write cues</span>
+    </label>
+    <label class="checkbox_label" for="fat_cue_hide">
+        <input id="fat_cue_hide" type="checkbox">
+        <span>Hide cues in the chat (adds a display-only regex script)</span>
+    </label>
+    <small>S2 models and Drama 3 read free-form cues. S1 only knows a fixed set, so other cues are dropped for it.</small>
 </div>`;
 
 export class FishAudioTtsProvider {
@@ -150,8 +174,62 @@ export class FishAudioTtsProvider {
         return SETTINGS_HTML;
     }
 
+    /** SillyTavern clears extension prompts whenever a chat loads, so the cue instruction is re-applied. */
+    reapplyCuePrompt = () => this.applyCuePrompt();
+
     dispose() {
         this.previewAudio.pause();
+        const { eventSource, eventTypes, setExtensionPrompt } = SillyTavern.getContext();
+        eventSource.removeListener(eventTypes.CHAT_CHANGED, this.reapplyCuePrompt);
+        eventSource.removeListener(eventTypes.GENERATION_STARTED, this.reapplyCuePrompt);
+        setExtensionPrompt(CUE_PROMPT_KEY, '', IN_CHAT, 1, false, SYSTEM_ROLE);
+    }
+
+    /**
+     * Keeps the cue instruction in the prompt while it's wanted. The filter
+     * runs at every prompt build, so it drops out as soon as TTS is off or
+     * another provider is picked.
+     */
+    applyCuePrompt() {
+        const context = SillyTavern.getContext();
+        const value = this.settings.cue_prompt ? cueInstruction(this.settings.model) : '';
+        context.setExtensionPrompt(CUE_PROMPT_KEY, value, IN_CHAT, 1, false, SYSTEM_ROLE, () => {
+            const tts = SillyTavern.getContext().extensionSettings.tts;
+            return Boolean(this.settings.cue_prompt && tts?.enabled && tts.currentProvider === PROVIDER_NAME);
+        });
+    }
+
+    cueScriptInstalled() {
+        const scripts = SillyTavern.getContext().extensionSettings.regex;
+        return Array.isArray(scripts) && scripts.some(s => s?.scriptName === CUE_SCRIPT_NAME);
+    }
+
+    /** Adds or removes a global, display-only regex script that hides cues in chat messages. @param {boolean} on */
+    async setCueScript(on) {
+        const context = SillyTavern.getContext();
+        const scripts = Array.isArray(context.extensionSettings.regex) ? context.extensionSettings.regex : [];
+        const rest = scripts.filter(s => s?.scriptName !== CUE_SCRIPT_NAME);
+        if (on) {
+            rest.push({
+                id: crypto.randomUUID(),
+                scriptName: CUE_SCRIPT_NAME,
+                findRegex: CUE_DISPLAY_REGEX,
+                replaceString: '',
+                trimStrings: [],
+                placement: [AI_OUTPUT],
+                disabled: false,
+                markdownOnly: true,
+                promptOnly: false,
+                runOnEdit: true,
+                substituteRegex: 0,
+                minDepth: null,
+                maxDepth: null,
+            });
+        }
+        context.extensionSettings.regex = rest;
+        context.saveSettingsDebounced();
+        await context.reloadCurrentChat();
+        toastr.info(on ? `Added the regex script "${CUE_SCRIPT_NAME}".` : 'Removed the cue-hiding regex script.', 'Fish Audio TTS');
     }
 
     /** @param {Record<string, any>} stored */
@@ -163,6 +241,10 @@ export class FishAudioTtsProvider {
         this.refreshCache();
         this.renderSavedVoices();
         this.renderSpeakers();
+        this.applyCuePrompt();
+        const { eventSource, eventTypes } = SillyTavern.getContext();
+        eventSource.on(eventTypes.CHAT_CHANGED, this.reapplyCuePrompt);
+        eventSource.on(eventTypes.GENERATION_STARTED, this.reapplyCuePrompt);
     }
 
     async checkReady() {
@@ -185,8 +267,14 @@ export class FishAudioTtsProvider {
         if (this.status?.keySet && stale) {
             try {
                 const data = await pluginApi('/voices?self=true&page_size=100');
+                const before = this.ownVoices.map(v => v.id).join();
                 this.ownVoices = data.items ?? [];
                 this.ownVoicesAt = Date.now();
+                // Own voices are speaker choices too. Only redraw when they change, so typing isn't interrupted.
+                if (before !== this.ownVoices.map(v => v.id).join()) {
+                    this.voices = buildVoiceObjects(this.settings.savedVoices, this.ownVoices);
+                    this.renderSpeakers();
+                }
             } catch (error) {
                 console.warn('[Fish Audio TTS] could not list your own voices:', error.message);
             }
@@ -210,9 +298,12 @@ export class FishAudioTtsProvider {
      * @param {string} text
      */
     async processText(text) {
-        if (!this.settings.multi_speaker) return text;
-        if (!this.voices.length) await this.fetchTtsVoiceObjects();
-        return markSpeakerLines(text, (name) => Boolean(this.speakerVoiceId(name)));
+        let out = text;
+        if (this.settings.multi_speaker) {
+            if (!this.voices.length) await this.fetchTtsVoiceObjects();
+            out = markSpeakerLines(out, (name) => Boolean(this.speakerVoiceId(name)));
+        }
+        return rewriteCues(out, this.settings.model, this.settings.cues);
     }
 
     /**
@@ -419,7 +510,7 @@ export class FishAudioTtsProvider {
         const box = document.getElementById('fat_speakers');
         if (!box) return;
         box.replaceChildren();
-        const labels = this.settings.savedVoices.map(v => v.label);
+        const labels = buildVoiceObjects(this.settings.savedVoices, this.ownVoices).map(v => v.name);
         this.settings.speakers.forEach((speaker, index) => {
             const row = document.createElement('div');
             row.className = 'fat-saved-row';
@@ -433,7 +524,7 @@ export class FishAudioTtsProvider {
             const voice = document.createElement('select');
             voice.className = 'text_pole flex1';
             const options = labels.includes(speaker.voice) || !speaker.voice ? labels : [speaker.voice, ...labels];
-            voice.append(new Option('Pick a saved voice', ''), ...options.map(l => new Option(l, l)));
+            voice.append(new Option('Pick a voice', ''), ...options.map(l => new Option(l, l)));
             voice.value = speaker.voice;
             voice.addEventListener('change', () => {
                 speaker.voice = voice.value;
@@ -588,6 +679,7 @@ export class FishAudioTtsProvider {
         $model.on('change', () => {
             s.model = String($model.val());
             saveTtsProviderSettings();
+            this.applyCuePrompt();
         });
         $('#fat_latency').val(s.latency).on('change', function () {
             s.latency = String($(this).val());
@@ -615,6 +707,18 @@ export class FishAudioTtsProvider {
             saveTtsProviderSettings();
         });
         $('#fat_speaker_add').on('click', () => this.addSpeaker());
+        $('#fat_cues').prop('checked', s.cues).on('change', function () {
+            s.cues = Boolean($(this).prop('checked'));
+            saveTtsProviderSettings();
+        });
+        $('#fat_cue_prompt').prop('checked', s.cue_prompt).on('change', (e) => {
+            s.cue_prompt = Boolean($(e.currentTarget).prop('checked'));
+            saveTtsProviderSettings();
+            this.applyCuePrompt();
+        });
+        $('#fat_cue_hide').prop('checked', this.cueScriptInstalled()).on('change', (e) => {
+            this.setCueScript(Boolean($(e.currentTarget).prop('checked')));
+        });
         $('#fat_speaker_preview').on('click', () => this.previewLastMessage());
 
         $('#fat_key_save').on('click', () => this.saveKey());
