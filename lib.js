@@ -615,3 +615,62 @@ export function estimateCost(text, model) {
     const price = MODEL_PRICES[model];
     return { bytes, usd: price === undefined ? null : bytes * price / 1e6 };
 }
+
+// Voice design from a character card.
+
+const CARD_FIELD_LIMIT = 2500;
+
+/**
+ * Prompt for the user's chat model to turn a character card into a short
+ * voice casting brief for Fish's voice designer.
+ * @param {{name: string, description?: string, personality?: string, scenario?: string}} card Macros already substituted
+ * @returns {{systemPrompt: string, prompt: string}}
+ */
+export function buildBriefPrompt(card) {
+    const field = (label, value) => {
+        const text = String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, CARD_FIELD_LIMIT);
+        return text ? `${label}: ${text}` : '';
+    };
+    const facts = [
+        field('Name', card.name),
+        field('Description', card.description),
+        field('Personality', card.personality),
+        field('Scenario', card.scenario),
+    ].filter(Boolean).join('\n');
+    return {
+        systemPrompt: 'You write short voice casting briefs for a text-to-speech voice designer. Answer with the brief only.',
+        prompt: `${facts}\n\nWrite one voice casting brief for this character: gender, apparent age, accent, pitch, tone, pace, `
+            + 'and anything distinctive about how they sound. Two sentences at most, under 300 characters. '
+            + 'Describe only the voice. No names, no quotes, no story details.',
+    };
+}
+
+/**
+ * Tidies a drafted brief: no quotes, markdown or line breaks, a sane length.
+ * @param {string} text
+ */
+export function cleanBrief(text) {
+    return String(text ?? '')
+        .replace(/<(think|thinking|reasoning)\b[^>]*>[\s\S]*?(?:<\/\1>|$)/gi, '')
+        .replace(/[*_#`"“”]/g, '')
+        .replace(/^\s*(voice\s*)?(casting\s*)?brief\s*:\s*/i, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 600);
+}
+
+const PREVIEW_DEFAULT = 'Hello. It is good to finally meet you.';
+
+/**
+ * A line for the candidates to read: the first quoted line of the character's
+ * greeting if it fits Fish's 150-character limit, else a neutral line.
+ * @param {string} firstMessage Macros already substituted
+ */
+export function pickPreviewLine(firstMessage) {
+    const quotes = String(firstMessage ?? '').match(/"([^"\n]{12,150})"|“([^”\n]{12,150})”/g) ?? [];
+    for (const quote of quotes) {
+        const line = quote.slice(1, -1).replace(/[*_]/g, '').replace(/\s+/g, ' ').trim();
+        if (line.length >= 12 && line.length <= 150) return line;
+    }
+    return PREVIEW_DEFAULT;
+}

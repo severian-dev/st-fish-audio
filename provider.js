@@ -3,8 +3,9 @@
 // the API key and streams audio back. generateTts returns the plugin's stream
 // URL, which SillyTavern plays directly as the audio element's src.
 
-import { getPreviewString, initVoiceMap, saveTtsProviderSettings } from '../../tts/index.js';
+import { getPreviewString, initVoiceMap, sanitizeId, saveTtsProviderSettings } from '../../tts/index.js';
 import { openVoiceBrowser } from './browser.js';
+import { openVoiceDesigner } from './designer.js';
 import {
     buildSpeakerRequest,
     buildTtsBody,
@@ -146,6 +147,7 @@ const SETTINGS_HTML = `
     <small>Saved voices show up in the voice map. Your own Fish voices are added automatically.</small>
     <div class="flex-container flexGap5">
         <div id="fat_browse" class="menu_button menu_button_icon"><i class="fa-solid fa-magnifying-glass"></i><span>Browse voices</span></div>
+        <div id="fat_design" class="menu_button menu_button_icon" hidden title="Create a new voice from a description or the character card. $0.01 per design."><i class="fa-solid fa-wand-magic-sparkles"></i><span>Design a voice</span></div>
     </div>
     <div class="flex-container flexGap5 alignItemsCenter">
         <input id="fat_add_input" type="text" class="text_pole flex1" placeholder="Voice ID or fish.audio link">
@@ -491,6 +493,7 @@ export class FishAudioTtsProvider {
         }
         this.renderStatus();
         this.renderModels();
+        $('#fat_design').prop('hidden', !this.hasFeature('design'));
     }
 
     async refreshCredit() {
@@ -703,12 +706,54 @@ export class FishAudioTtsProvider {
         return button;
     }
 
-    /** @param {{id: string, title: string, languages?: string[], sample?: string|null, cover?: string|null}} voice */
+    /**
+     * Adds a voice to the saved list unless it's there already.
+     * @param {{id: string, title: string, languages?: string[], sample?: string|null, cover?: string|null}} voice
+     * @returns {Promise<{label: string, added: boolean}>}
+     */
     async saveVoice(voice) {
-        if (this.settings.savedVoices.some(v => v.id === voice.id)) return false;
-        this.settings.savedVoices.push(toSavedVoice(voice, this.settings.savedVoices));
+        const existing = this.settings.savedVoices.find(v => v.id === voice.id);
+        if (existing) return { label: existing.label, added: false };
+        const saved = toSavedVoice(voice, this.settings.savedVoices);
+        this.settings.savedVoices.push(saved);
         await this.voicesChanged();
+        return { label: saved.label, added: true };
+    }
+
+    /** Names in SillyTavern's voice map for the current chat, "[Default Voice]" first. */
+    voiceMapCharacters() {
+        return [...document.querySelectorAll('#tts_voicemap_block .tts_voicemap_block_char > span')]
+            .map(span => span.textContent ?? '')
+            .filter(Boolean);
+    }
+
+    /**
+     * Picks a voice for a character through SillyTavern's own voice map
+     * dropdown, so its save logic runs as if the user had picked it.
+     * @param {string} character Voice map entry name
+     * @param {string} label Saved voice label
+     */
+    assignVoice(character, label) {
+        const select = $(`#tts_voicemap_char_${sanitizeId(character)}_voice`);
+        if (!select.length || !select.find('option').toArray().some(o => o.value === label)) return false;
+        select.val(label).trigger('change');
         return true;
+    }
+
+    /**
+     * Saves a voice if needed and gives it to a character.
+     * @param {any} voice Voice from the plugin
+     * @param {string} character Voice map entry name
+     * @returns {Promise<string>} The voice's label
+     */
+    async useVoiceFor(voice, character) {
+        const { label } = await this.saveVoice(voice);
+        if (this.assignVoice(character, label)) {
+            toastr.success(`"${label}" now voices ${character === DEFAULT_VOICE_MARKER ? 'everyone without their own voice' : character}.`, 'Fish Audio TTS');
+        } else {
+            toastr.info(`Saved "${label}". Pick it for ${character} in the voice map.`, 'Fish Audio TTS');
+        }
+        return label;
     }
 
     /** @param {string} id */
@@ -734,7 +779,7 @@ export class FishAudioTtsProvider {
         }
         try {
             const voice = await pluginApi(`/voices/${id}`);
-            const added = await this.saveVoice(voice);
+            const { added } = await this.saveVoice(voice);
             input.value = '';
             toastr.success(added ? `Saved "${voice.title}".` : 'That voice is already saved.', 'Fish Audio TTS');
         } catch (error) {
@@ -859,6 +904,25 @@ export class FishAudioTtsProvider {
             isSaved: (id) => this.settings.savedVoices.some(v => v.id === id),
             onSave: (voice) => this.saveVoice(voice),
             canListOwn: Boolean(this.status?.keySet),
+            characters: this.voiceMapCharacters(),
+            onUseFor: async (voice, character) => { await this.useVoiceFor(voice, character); },
         }));
+        $('#fat_design').on('click', () => {
+            const characters = this.voiceMapCharacters();
+            if (!characters.length) {
+                toastr.info('Open a chat and turn TTS on first, so there is a character to design for.', 'Fish Audio TTS');
+                return;
+            }
+            openVoiceDesigner({
+                api: pluginApi,
+                characters,
+                defaultCharacter: SillyTavern.getContext().name2,
+                onSaved: (voice, character) => {
+                    // A new voice has no free sample, and the own-voices list should pick it up.
+                    this.ownVoicesAt = 0;
+                    return this.useVoiceFor(voice, character);
+                },
+            });
+        });
     }
 }

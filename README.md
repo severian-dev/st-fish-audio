@@ -1,8 +1,14 @@
 # Fish Audio TTS
 
 [Fish Audio](https://fish.audio) voices in SillyTavern's built-in TTS. Narration modes, the voice map, `/speak` and
-the narrate buttons work as usual. Adds a voice browser with free sample playback, several voices in one message,
-emotion cues, dialogue-only reading, infobox skipping, and an audio cache so repeated lines cost nothing.
+the narrate buttons work as usual. Adds a voice browser with free sample playback, voice design from a character
+card, several voices in one message, emotion cues, dialogue-only reading, infobox skipping, and an audio cache so
+repeated lines cost nothing.
+
+<p>
+  <img src="docs/voice-browser.png" width="49%" alt="Voice browser: search Fish's library, play samples, save or use for a character">
+  <img src="docs/voice-designer.png" width="49%" alt="Voice designer: a brief drafted from the character card, three candidates to audition">
+</p>
 
 Two parts: this extension and a small [server plugin](https://github.com/severian-dev/st-fish-audio-plugin). Fish's
 speech API does not accept calls from a browser, so the plugin makes them from the SillyTavern server. Your API key
@@ -26,10 +32,22 @@ Tested on SillyTavern 1.19.0.
 ## Voices
 
 - **Browse voices** searches Fish's public library by name, language and popularity. Samples are free to play. Save
-  the ones you like.
+  the ones you like, or pick **Use for...** to save a voice and give it to a character in one go.
 - Or paste a voice ID or a fish.audio voice link and hit Add.
 - Your own Fish voices show up automatically.
-- Saved voices appear in the voice map. Pick one per character.
+- Saved voices appear in SillyTavern's voice map, one per character. Characters in the current chat are listed there,
+  plus "[Default Voice]" for everyone else and your own persona when "Narrate user messages" is on.
+
+## Design a voice
+
+**Design a voice** creates a new voice from a description. Pick the character, hit **Draft from character card** to
+have your connected chat model write the description from the card (your persona's description for your own voice),
+edit it if you like, and design. Fish returns 2 to 4 candidates reading a line from the character's greeting. Play
+them, then **Use this voice**: it's saved to your Fish account as a private voice and set as that character's voice.
+
+Fish charges $0.01 per design, however many candidates. Saving takes about 15 seconds.
+
+## What gets read
 
 ## What gets read
 
@@ -82,6 +100,8 @@ and drops the ones it can't read.
 - **Hide cues in the chat.** Adds a display-only regex script, "Fish Audio TTS: hide voice cues". Messages keep the
   cues, TTS still reads them, you just don't see them. Untick to remove the script.
 
+<img src="docs/preview.png" width="640" alt="Preview of what gets read: narration in the character's voice, a speaker line in its own voice, the infobox skipped, bytes and cost">
+
 ## Audio cache
 
 The plugin keeps generated audio on the SillyTavern server, per user. A line spoken again with the same voice and
@@ -120,6 +140,8 @@ Drama 3 follows directions much more closely than S2.1 Pro. In testing with the 
 
 ## Settings
 
+<img src="docs/settings.png" width="324" align="right" alt="Fish Audio TTS settings panel">
+
 | Setting | Default | Notes |
 | --- | --- | --- |
 | Model | S2.1 Pro Free | See above. |
@@ -136,6 +158,8 @@ Drama 3 follows directions much more closely than S2.1 Pro. In testing with the 
 | Several voices per message | on | |
 | Use cues | on | |
 | Ask the chat model to write cues | off | Drama 3 gets its own instruction with directions and word tags. |
+
+<br clear="right">
 
 ## How it works
 

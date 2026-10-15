@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+    buildBriefPrompt,
     buildSpeakerRequest,
     buildTtsBody,
     buildVoiceObjects,
+    cleanBrief,
     compareVersions,
     CUE_DISPLAY_REGEX,
     cueInstruction,
@@ -19,6 +21,7 @@ import {
     MUTED,
     parseTagList,
     parseVoiceInput,
+    pickPreviewLine,
     removeTagBlocks,
     removeUnspoken,
     rewriteCues,
@@ -332,5 +335,25 @@ describe('Drama 3', () => {
         assert.deepEqual(estimateCost('x'.repeat(8000), 'drama-3'), { bytes: 8000, usd: 0.08 });
         assert.equal(estimateCost('日本語', 's2.1-pro').bytes, 9);
         assert.equal(estimateCost('hi', 's2.1-pro-free').usd, 0);
+    });
+});
+
+describe('voice design helpers', () => {
+    it('builds a brief prompt from card fields, capped and without empty fields', () => {
+        const { systemPrompt, prompt } = buildBriefPrompt({ name: 'Seraphina', description: 'A forest guardian.\n\nKind.', personality: '', scenario: 'x'.repeat(5000) });
+        assert.match(systemPrompt, /casting briefs/);
+        assert.match(prompt, /^Name: Seraphina\nDescription: A forest guardian. Kind.\nScenario: x+\n\nWrite one voice casting brief/);
+        assert.equal(prompt.includes('Personality'), false);
+        assert.ok(prompt.length < 3000);
+    });
+
+    it('cleans a drafted brief', () => {
+        assert.equal(cleanBrief('<think>hmm</think>**Voice brief:** "A warm,\n low female voice."'), 'A warm, low female voice.');
+    });
+
+    it('picks a quoted greeting line that fits, else a default', () => {
+        assert.equal(pickPreviewLine('*She smiles.* "Ah, you are awake at last. I was so worried." She sits.'), 'Ah, you are awake at last. I was so worried.');
+        assert.equal(pickPreviewLine('"Hi." "' + 'z'.repeat(200) + '"'), 'Hello. It is good to finally meet you.');
+        assert.equal(pickPreviewLine(''), 'Hello. It is good to finally meet you.');
     });
 });

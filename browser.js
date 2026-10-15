@@ -1,22 +1,11 @@
 // Voice browser popup: search Fish's public library, play the free sample
-// clips, save voices. Everything from Fish is user-written, so the DOM is
-// built with textContent only.
+// clips, save voices or put one straight on a character. Everything from
+// Fish is user-written, so the DOM is built with textContent only.
 
-const LANGUAGES = [
-    ['', 'Any language'], ['en', 'English'], ['ja', 'Japanese'], ['zh', 'Chinese'], ['ko', 'Korean'],
-    ['es', 'Spanish'], ['fr', 'French'], ['de', 'German'], ['pt', 'Portuguese'], ['it', 'Italian'],
-    ['ru', 'Russian'], ['ar', 'Arabic'], ['hi', 'Hindi'], ['id', 'Indonesian'], ['vi', 'Vietnamese'],
-    ['th', 'Thai'], ['tr', 'Turkish'], ['pl', 'Polish'], ['nl', 'Dutch'],
-];
+import { characterLabel, el, LANGUAGES } from './dom.js';
+
 const SORTS = [['task_count', 'Most used'], ['score', 'Recommended'], ['created_at', 'Newest']];
 const PAGE_SIZE = 20;
-
-/** @param {string} tag @param {Record<string, any>} [props] @param {...(Node|string)} children */
-function el(tag, props = {}, ...children) {
-    const node = Object.assign(document.createElement(tag), props);
-    node.append(...children);
-    return node;
-}
 
 /** @param {number} n */
 function compact(n) {
@@ -29,8 +18,10 @@ function compact(n) {
  * @param {(id: string) => boolean} options.isSaved
  * @param {(voice: any) => Promise<boolean>} options.onSave
  * @param {boolean} options.canListOwn Whether a key is set, so "my voices" can be listed
+ * @param {string[]} options.characters Voice map entries a voice can be put on
+ * @param {(voice: any, character: string) => Promise<void>} options.onUseFor Saves the voice and assigns it
  */
-export async function openVoiceBrowser({ api, isSaved, onSave, canListOwn }) {
+export async function openVoiceBrowser({ api, isSaved, onSave, canListOwn, characters, onUseFor }) {
     const { callGenericPopup, POPUP_TYPE } = SillyTavern.getContext();
     const audio = new Audio();
     /** @type {HTMLElement|null} */
@@ -38,7 +29,7 @@ export async function openVoiceBrowser({ api, isSaved, onSave, canListOwn }) {
 
     const search = el('input', { type: 'search', className: 'text_pole fat-search', placeholder: 'Search voices by name' });
     const language = el('select', { className: 'text_pole' });
-    language.append(...LANGUAGES.map(([value, label]) => new Option(label, value)));
+    language.append(new Option('Any language', ''), ...LANGUAGES.map(([value, label]) => new Option(label, value)));
     const sort = el('select', { className: 'text_pole' });
     sort.append(...SORTS.map(([value, label]) => new Option(label, value)));
     const mine = el('input', { type: 'checkbox', disabled: !canListOwn });
@@ -54,6 +45,8 @@ export async function openVoiceBrowser({ api, isSaved, onSave, canListOwn }) {
 
     let page = 1;
     let loading = false;
+    // A new search replaces one still loading. Only the latest search's results are shown.
+    let generation = 0;
 
     function stopSample() {
         audio.pause();
@@ -90,7 +83,23 @@ export async function openVoiceBrowser({ api, isSaved, onSave, canListOwn }) {
             if (save.classList.contains('disabled')) return;
             save.classList.add('disabled');
             await onSave(voice);
+            markSaved();
+        });
+
+        const markSaved = () => {
             save.textContent = 'Saved';
+            save.classList.add('disabled');
+        };
+        const useFor = el('select', { className: 'text_pole fat-use-for', title: 'Save this voice and give it to a character' });
+        useFor.append(new Option('Use for...', ''), ...characters.map(name => new Option(characterLabel(name), name)));
+        useFor.hidden = !characters.length;
+        useFor.addEventListener('change', async () => {
+            if (!useFor.value) return;
+            useFor.disabled = true;
+            await onUseFor(voice, useFor.value);
+            markSaved();
+            useFor.value = '';
+            useFor.disabled = false;
         });
 
         return el('div', { className: 'fat-card', title: voice.description },
@@ -99,16 +108,19 @@ export async function openVoiceBrowser({ api, isSaved, onSave, canListOwn }) {
                 el('div', { className: 'fat-card-title' }, voice.title),
                 el('small', {}, meta),
                 el('small', {}, stats),
-                tags),
+                tags,
+                useFor),
             el('div', { className: 'fat-card-actions' }, play, save));
     }
 
     async function load(reset) {
-        if (loading) return;
+        if (loading && !reset) return;
+        const mine = ++generation;
         loading = true;
         if (reset) {
             page = 1;
             grid.replaceChildren();
+            more.hidden = true;
         }
         info.textContent = 'Loading...';
         const params = new URLSearchParams({ page_size: String(PAGE_SIZE), page_number: String(page), sort_by: sort.value });
@@ -117,15 +129,16 @@ export async function openVoiceBrowser({ api, isSaved, onSave, canListOwn }) {
         if (mine.checked) params.set('self', 'true');
         try {
             const data = await api(`/voices?${params}`);
+            if (mine !== generation) return;
             grid.append(...data.items.map(card));
             const shown = grid.children.length;
             info.textContent = shown ? `${shown} voice${shown === 1 ? '' : 's'} shown. Samples are free to play.` : 'No voices found.';
             more.hidden = !data.hasMore;
             page++;
         } catch (error) {
-            info.textContent = `Could not load voices: ${error.message}`;
+            if (mine === generation) info.textContent = `Could not load voices: ${error.message}`;
         } finally {
-            loading = false;
+            if (mine === generation) loading = false;
         }
     }
 
