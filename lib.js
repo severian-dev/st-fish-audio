@@ -23,6 +23,7 @@ export const DEFAULT_SETTINGS = Object.freeze({
     temperature: 0.7,
     top_p: 0.7,
     normalize_loudness: true,
+    cache_audio: true,
     /** @type {SavedVoice[]} */
     savedVoices: [],
 });
@@ -204,6 +205,7 @@ export function buildTtsBody(text, voiceId, settings) {
         temperature: settings.temperature,
         top_p: settings.top_p,
         prosody: { speed: settings.speed, normalize_loudness: settings.normalize_loudness },
+        cache: settings.cache_audio,
     };
 }
 
@@ -220,6 +222,13 @@ export function compareVersions(a, b) {
         if (diff) return diff;
     }
     return 0;
+}
+
+/** @param {number} bytes */
+export function formatBytes(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 1024) return `${Math.max(0, Math.round(bytes) || 0)} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /**

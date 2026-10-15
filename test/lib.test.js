@@ -6,6 +6,7 @@ import {
     buildVoiceObjects,
     compareVersions,
     DEFAULT_SETTINGS,
+    formatBytes,
     formatCredit,
     mergeSettings,
     parseVoiceInput,
@@ -95,7 +96,7 @@ describe('buildTtsBody', () => {
         const body = buildTtsBody('Hello', ID, { ...DEFAULT_SETTINGS, speed: 1.2 });
         assert.deepEqual(body, {
             text: 'Hello', reference_id: ID, model: 's2.1-pro-free', latency: 'balanced',
-            temperature: 0.7, top_p: 0.7, prosody: { speed: 1.2, normalize_loudness: true },
+            temperature: 0.7, top_p: 0.7, prosody: { speed: 1.2, normalize_loudness: true }, cache: true,
         });
     });
 });
@@ -106,6 +107,12 @@ describe('misc', () => {
         assert.ok(compareVersions('0.0.9', '0.1.0') < 0);
         assert.ok(compareVersions('0.10.0', '0.9.1') > 0);
         assert.ok(compareVersions('1.0', '1.0.1') < 0);
+    });
+
+    it('formats bytes', () => {
+        assert.equal(formatBytes(0), '0 B');
+        assert.equal(formatBytes(2048), '2 KB');
+        assert.equal(formatBytes(5 * 1024 * 1024), '5.0 MB');
     });
 
     it('formats credit', () => {

@@ -9,6 +9,7 @@ import {
     buildTtsBody,
     buildVoiceObjects,
     compareVersions,
+    formatBytes,
     formatCredit,
     isVoiceId,
     mergeSettings,
@@ -87,6 +88,16 @@ const SETTINGS_HTML = `
         <input id="fat_normalize_loudness" type="checkbox">
         <span>Even out loudness (S2 models)</span>
     </label>
+    <div id="fat_cache_block" class="fat-cache" hidden>
+        <label class="checkbox_label" for="fat_cache_audio">
+            <input id="fat_cache_audio" type="checkbox">
+            <span>Reuse audio for lines already spoken (saves credit)</span>
+        </label>
+        <div class="flex-container flexGap5 alignItemsCenter">
+            <small id="fat_cache_stats" class="flex1"></small>
+            <div id="fat_cache_clear" class="menu_button" title="Delete cached audio from the server">Clear</div>
+        </div>
+    </div>
     <h4 class="fat-heading">Voices</h4>
     <small>Saved voices show up in the voice map. Your own Fish voices are added automatically.</small>
     <div class="flex-container flexGap5">
@@ -127,6 +138,7 @@ export class FishAudioTtsProvider {
         this.bindUi();
         await this.refreshStatus();
         this.refreshCredit();
+        this.refreshCache();
         this.renderSavedVoices();
     }
 
@@ -141,6 +153,7 @@ export class FishAudioTtsProvider {
         this.ownVoicesAt = 0;
         await this.refreshStatus();
         this.refreshCredit();
+        this.refreshCache();
         this.voices = await this.fetchTtsVoiceObjects();
     }
 
@@ -242,6 +255,29 @@ export class FishAudioTtsProvider {
             }
         }
         this.renderStatus();
+    }
+
+    hasFeature(name) {
+        return Boolean(this.status?.features?.includes(name));
+    }
+
+    async refreshCache() {
+        const block = document.getElementById('fat_cache_block');
+        if (!block) return;
+        block.hidden = !this.hasFeature('cache');
+        if (block.hidden) return;
+        const stats = await pluginApi('/cache').catch(() => null);
+        $('#fat_cache_stats').text(stats ? `${stats.files} clip${stats.files === 1 ? '' : 's'} cached, ${formatBytes(stats.bytes)}` : '');
+    }
+
+    async clearCache() {
+        try {
+            await pluginApi('/cache', { method: 'DELETE' });
+            toastr.info('Cached audio cleared.', 'Fish Audio TTS');
+        } catch (error) {
+            toastr.error(`Could not clear the cache: ${error.message}`, 'Fish Audio TTS');
+        }
+        this.refreshCache();
     }
 
     renderStatus() {
@@ -416,6 +452,11 @@ export class FishAudioTtsProvider {
             s.normalize_loudness = Boolean($(this).prop('checked'));
             saveTtsProviderSettings();
         });
+        $('#fat_cache_audio').prop('checked', s.cache_audio).on('change', function () {
+            s.cache_audio = Boolean($(this).prop('checked'));
+            saveTtsProviderSettings();
+        });
+        $('#fat_cache_clear').on('click', () => this.clearCache());
 
         $('#fat_key_save').on('click', () => this.saveKey());
         $('#fat_key_remove').on('click', () => this.removeKey());
