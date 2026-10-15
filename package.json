@@ -1,0 +1,10 @@
+{
+    "name": "st-fish-audio",
+    "version": "0.1.0",
+    "private": true,
+    "type": "module",
+    "license": "MIT",
+    "scripts": {
+        "test": "node --test test/*.test.js"
+    }
+}
